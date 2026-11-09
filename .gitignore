@@ -1,0 +1,15 @@
+# Build output and releases are published as GitHub Releases, not committed
+build/
+dist/
+release/
+
+# Local notes and debug output
+journal.md
+*.log
+RoadRashHD_*.csv
+RoadRashHD_frame_*.bmp
+
+# Game files must never be committed
+RoadRash95.exe
+*.DLL
+ResolutionPatch_Backup/

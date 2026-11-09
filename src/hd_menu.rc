@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#pragma code_page(65001)
+#include <windows.h>
+
+101 DIALOGEX 0, 0, 268, 126
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Resolution"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT "", 1001, 12, 12, 244, 16
+    LTEXT "Render resolution", -1, 12, 35, 76, 12
+    COMBOBOX 1002, 91, 32, 165, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT "The list follows the window aspect ratio to keep objects in proportion.", -1, 12, 60, 244, 12
+    LTEXT "Native is sharpest; a lower resolution improves performance.", -1, 12, 77, 244, 12
+    DEFPUSHBUTTON "Apply", IDOK, 132, 103, 58, 16
+    PUSHBUTTON "Cancel", IDCANCEL, 198, 103, 58, 16
+END

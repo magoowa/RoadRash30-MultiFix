@@ -21,6 +21,16 @@ Install copies `ddraw.dll`, `RoadRashMultiFix.dll` and (if missing) `RoadRashHD.
 - GOG Galaxy's **Verify / Repair** will not undo the patch, because the original files are untouched. Galaxy may remove the extra files on a full reinstall; just run the installer again.
 - Another `ddraw.dll` wrapper (dgVoodoo, cnc-ddraw, DDrawCompat, ...) cannot be used at the same time, because both use the same file name.
 
+## Linux, Steam Deck and Proton (experimental)
+
+The patch is a `ddraw.dll` proxy, so it can be loaded under Wine/Proton with a DLL override. **This is untested**; reports are welcome (please attach `RoadRashHD.log`).
+
+1. Download the release zip and use the `linux/` folder (it contains `install.sh`, `ddraw.dll`, `RoadRashMultiFix.dll` and `RoadRashHD.ini`).
+2. Run `./install.sh "/path/to/Road Rash 30th Anniversary Edition"` (the folder that contains `RoadRash95.exe`; for a Steam copy it is under `steamapps/common`). Add `--remove` to undo it.
+3. In Steam, set the launch option **`WINEDLLOVERRIDES="ddraw=n,b" %command%`** (outside Steam: `WINEDLLOVERRIDES="ddraw=n,b" wine RoadRash95.exe`).
+
+Notes: the Direct3D 11 renderer uses DXVK under Proton. Its shaders are compiled at build time, so no shader compiler is needed at run time. Under Wine the Direct3D surface is created on the game window itself (`[Graphics] ChildSurface=1` forces the Windows arrangement). If the picture is wrong, set `D3D11=0` in `RoadRashHD.ini` for the CPU renderer. `RoadRashHD.log` says "running under Wine ..." when Wine is detected.
+
 ## Features
 
 Inherited from the original project: automatic native resolution, native HD re-rasterization of roads and objects, aspect-ratio adaptation (standard / widescreen / ultrawide), in-game resolution selection, menu and rendering improvements.

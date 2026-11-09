@@ -1492,6 +1492,14 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     gpuVSync=GetPrivateProfileIntW(L"Graphics",L"VSync",0,configPath.c_str())!=0?1:0;
     gpuCompare=GetPrivateProfileIntW(L"Debug",L"CompareGpu",0,configPath.c_str())!=0;
     gpu.log=&status;
+    {   // Wine / Proton: the swap chain goes on the game window itself (the child-window arrangement is a workaround
+        // for the Windows DWM); [Graphics] ChildSurface=1/0 overrides the automatic choice.
+        typedef const char*(__cdecl* WineVersion)();
+        auto wineVersion=reinterpret_cast<WineVersion>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"wine_get_version"));
+        int surface=GetPrivateProfileIntW(L"Graphics",L"ChildSurface",-1,configPath.c_str());
+        gpu.useChildWindow=surface>=0?surface!=0:wineVersion==nullptr;
+        if(wineVersion){std::string m=std::string("running under Wine ")+wineVersion()+(gpu.useChildWindow?" (Direct3D surface: child window)":" (Direct3D surface: game window)");status(m.c_str());}
+    }
     applyQuality();
     skipIntro=GetPrivateProfileIntW(L"Game",L"SkipIntro",0,configPath.c_str())!=0;
     fixPostcards=GetPrivateProfileIntW(L"Game",L"FixPostcards",1,configPath.c_str())!=0;

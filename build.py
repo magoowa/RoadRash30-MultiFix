@@ -38,15 +38,19 @@ def build(vcvarsall, tests):
     commands = ['@echo off', 'chcp 65001 >nul', f'call "{compiler_environment(vcvarsall)}" x86 >nul', 'if errorlevel 1 exit /b 1',
                 'cd /d "%~dp0.."',
                 'rc /nologo /fo build\\hd_menu.res src\\hd_menu.rc', 'if errorlevel 1 exit /b 1',
-                'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /LD src\\hd_renderer.cpp '
+                # Shaders are compiled here, not at run time (works under Wine/Proton, where d3dcompiler_47 may not cope).
+                'cl /nologo /std:c++17 /O2 /MT /EHsc /utf-8 tools\\compile_shaders.cpp /Fo:build\\compile_shaders.obj '
+                '/Fe:build\\compile_shaders.exe /link d3dcompiler.lib', 'if errorlevel 1 exit /b 1',
+                'build\\compile_shaders.exe build\\hd_shaders.inc', 'if errorlevel 1 exit /b 1',
+                'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /I build /LD src\\hd_renderer.cpp '
                 '/Fo:build\\hd_renderer.obj /Fe:build\\RoadRashMultiFix.dll /link /Brepro '
                 '/DEF:src\\hd_renderer.def build\\hd_menu.res user32.lib gdi32.lib', 'if errorlevel 1 exit /b 1',
                 'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /LD src\\ddraw_proxy.cpp '
                 '/Fo:build\\ddraw_proxy.obj /Fe:build\\ddraw.dll /link /Brepro '
                 '/DEF:src\\ddraw_proxy.def user32.lib', 'if errorlevel 1 exit /b 1']
     if tests:
-        for name in ['hd_test', 'hd_loader_test', 'hd_perf_test', 'hd_animation_test']:
-            commands.extend([f'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 tests\\{name}.cpp '
+        for name in ['hd_test', 'hd_loader_test', 'hd_perf_test', 'hd_animation_test', 'hd_gpu_test']:
+            commands.extend([f'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /I build tests\\{name}.cpp '
                              f'/Fo:build\\{name}.obj /Fe:build\\{name}.exe /link user32.lib gdi32.lib',
                              'if errorlevel 1 exit /b 1'])
     commands.append('exit /b 0')

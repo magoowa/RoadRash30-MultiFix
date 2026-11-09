@@ -62,6 +62,7 @@ internal static class Installer
         new PatchOption("Window", "AltEnterFullscreen", true, "Alt+Enter / F11 Fullscreen Toggle", "Switches between the window and borderless fullscreen"),
         new PatchOption("Input", "SymmetricSteering", true, "Symmetric Analog Steering", "Controller stick turns right as gently as left (the game made right about twice as sensitive)"),
         new PatchOption("Input", "PadDialogs", true, "Controller Answers Dialogs", "A = OK / Yes and B = Cancel / No in the game's message boxes (for example when quitting)"),
+        new PatchOption("Game", "FixBikeColors", true, "Fix Bike Colors", "The Rat and Super bikes have swapped colours in the race; they now match the showroom"),
         new PatchOption("Window", "AutoHideCursor", true, "Auto-Hide Mouse Cursor", "Hidden at start and after 3 s without mouse movement; returns when you move the mouse"),
         new PatchOption("Window", "StartFullscreen", true, "Start in Fullscreen", "Opens the game in borderless fullscreen"),
         new PatchOption("Game", "SkipIntro", false, "Skip Intro Videos", "Skips the studio logos and the intro movie (menu music still starts)"),
@@ -280,6 +281,22 @@ internal static class Installer
         var value = new StringBuilder(32);
         GetPrivateProfileString("Game", "Language", "Auto", value, 32, ini);
         return value.ToString();
+    }
+    // Video volume (0-100) in [Game] VideoVolume; 100 when the ini does not exist yet.
+    public static int ReadVideoVolume(string folder)
+    {
+        string ini = Path.Combine(folder ?? "", IniName);
+        if (!File.Exists(ini)) return 100;
+        return Math.Max(0, Math.Min(100, (int)GetPrivateProfileInt("Game", "VideoVolume", 100, ini)));
+    }
+    public static bool SaveVideoVolume(string folder, int percent)
+    {
+        try
+        {
+            string ini = Path.Combine(folder ?? "", IniName);
+            return File.Exists(ini) && WritePrivateProfileString("Game", "VideoVolume", Math.Max(0, Math.Min(100, percent)).ToString(), ini);
+        }
+        catch (Exception) { return false; }
     }
     public static bool SaveLanguage(string folder, string name)
     {

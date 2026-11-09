@@ -2,6 +2,9 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <audiopolicy.h>
 #include <vector>
 #include <string>
 #include <cstdio>
@@ -403,7 +406,8 @@ void status(const char* message) {
 // seconds: average time per stage and the distribution of presented-frame
 // intervals, which is what a viewer perceives as stutter.
 bool profileEnabled=false;
-bool gpuFrame=false,fixPostcards=true;
+bool gpuFrame=false,fixPostcards=true,fixBikeColors=true;
+int videoVolume=100;   // [Game] VideoVolume, percent
 bool asyncControllerScan=true,fixTextEncoding=true,skipIntro=false,fullRateObjects=true;
 int dumpEverySeconds=0,dumpScale=2;
 void logWindow(HWND window) {
@@ -1296,11 +1300,38 @@ DWORD WINAPI videoSkipThread(LPVOID context) {
     }
     return 0;
 }
+// Video volume ([Game] VideoVolume, 0-100). Both players (MCI for .avi, Media Foundation for .mp4) play through
+// the process's default audio session, so while a video plays that session's volume is scaled by the setting and
+// restored afterwards (the Windows volume mixer's own level for the game is kept as the reference).
+struct VideoVolumeScope {
+    ISimpleAudioVolume* volume=nullptr;float original=1.0f;bool uninitialize=false;
+    explicit VideoVolumeScope(int percent) {
+        if(percent>=100)return;
+        HRESULT hr=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+        uninitialize=SUCCEEDED(hr);
+        IMMDeviceEnumerator* enumerator=nullptr;IMMDevice* device=nullptr;IAudioSessionManager* manager=nullptr;
+        if(SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator),nullptr,CLSCTX_ALL,__uuidof(IMMDeviceEnumerator),reinterpret_cast<void**>(&enumerator))) &&
+           SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender,eConsole,&device)) &&
+           SUCCEEDED(device->Activate(__uuidof(IAudioSessionManager),CLSCTX_ALL,nullptr,reinterpret_cast<void**>(&manager))) &&
+           SUCCEEDED(manager->GetSimpleAudioVolume(nullptr,FALSE,&volume)) && volume) {
+            if(SUCCEEDED(volume->GetMasterVolume(&original)))volume->SetMasterVolume(original*(percent<0?0:percent)/100.0f,nullptr);
+            else{volume->Release();volume=nullptr;}
+        }
+        if(manager)manager->Release();if(device)device->Release();if(enumerator)enumerator->Release();
+    }
+    ~VideoVolumeScope() {
+        if(volume){volume->SetMasterVolume(original,nullptr);volume->Release();}
+        if(uninitialize)CoUninitialize();
+    }
+};
 void __fastcall playVideoHook(const char* name,int second,int argument) {
     if(gpu.ready()){gpu.releaseWindow();status("video: Direct3D swap chain released");}
     VideoSkipState skip{GetCurrentThreadId(),0};
     HANDLE thread=CreateThread(nullptr,0,videoSkipThread,&skip,0,nullptr);
-    fn<PlayVideo>(0x410b20)(name,second,argument);
+    {
+        VideoVolumeScope scope(videoVolume);
+        fn<PlayVideo>(0x410b20)(name,second,argument);
+    }
     InterlockedExchange(&skip.done,1);
     if(thread){WaitForSingleObject(thread,1000);CloseHandle(thread);}
 }
@@ -1521,6 +1552,27 @@ bool initialize(HMODULE module) {
         if(match){for(auto s:sites)ok=branch(s,reinterpret_cast<void*>(&skipIntroVideo),0xe8)&&ok;}
         else status("skip intro ignored: unexpected start-up code");
     }
+    if(fixBikeColors) {
+        // The in-race bikes are drawn from one template and recoloured with one 256-byte palette remap per bike
+        // (15 tables at 0x596a90, indexed by the bike's spec number: 0-4 Rat, 5-9 Super, 10-14 Sport). The Rat and
+        // Super groups have their tables the wrong way round, so the 3D bike has the other class's colours (the
+        // shop pictures are correct). Anakin94's fix for the 1996 exe swaps the same two groups of five tables.
+        // The tables are verified by a hash first.
+        const uintptr_t tables=0x596a90;const size_t size=256;
+        uint64_t hash=0xcbf29ce484222325ull;
+        for(size_t i=0;i<15*size;++i)hash=(hash^at<uint8_t>(tables+i))*0x100000001b3ull;
+        if(hash==0x51d083b966bd8657ull) {
+            const int pairs[5][2]={{0,5},{1,6},{2,7},{3,8},{4,9}};
+            for(auto& p:pairs) {
+                uint8_t a[size],b[size];
+                std::memcpy(a,reinterpret_cast<void*>(base+tables-0x400000+p[0]*size),size);
+                std::memcpy(b,reinterpret_cast<void*>(base+tables-0x400000+p[1]*size),size);
+                ok=writeMemory(base+tables-0x400000+p[0]*size,b,size)&&ok;
+                ok=writeMemory(base+tables-0x400000+p[1]*size,a,size)&&ok;
+            }
+        }
+        else status("bike colour fix ignored: unexpected colour tables");
+    }
     if(languageCodeOf(languageSetting)>=0) {
         const uint8_t expect[6]={0x55,0x8b,0xec,0x81,0xec,0x0c};
         bool match=true;for(int i=0;i<6;++i)match=match && at<uint8_t>(0x43f9f0+i)==expect[i];
@@ -1601,6 +1653,9 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     }
     skipIntro=GetPrivateProfileIntW(L"Game",L"SkipIntro",0,configPath.c_str())!=0;
     fixPostcards=GetPrivateProfileIntW(L"Game",L"FixPostcards",1,configPath.c_str())!=0;
+    fixBikeColors=GetPrivateProfileIntW(L"Game",L"FixBikeColors",1,configPath.c_str())!=0;
+    videoVolume=int(GetPrivateProfileIntW(L"Game",L"VideoVolume",100,configPath.c_str()));
+    if(videoVolume<0)videoVolume=0;if(videoVolume>100)videoVolume=100;
     fullRateObjects=GetPrivateProfileIntW(L"Game",L"FullRateObjects",1,configPath.c_str())!=0;
     dumpEverySeconds=GetPrivateProfileIntW(L"Graphics",L"DumpFrameEverySeconds",0,configPath.c_str());
     dumpScale=GetPrivateProfileIntW(L"Graphics",L"DumpScale",2,configPath.c_str());

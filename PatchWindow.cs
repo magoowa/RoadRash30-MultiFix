@@ -24,6 +24,8 @@ internal sealed class PatchWindow : Form
     readonly Label status = new Label();
     readonly List<CheckBox> boxes = new List<CheckBox>();
     readonly ToolTip tips = new ToolTip();
+    readonly TrackBar videoVolume = new TrackBar();                  // [Game] VideoVolume
+    readonly Label videoVolumeText = new Label();
     readonly FlowLayoutPanel languageRow = new FlowLayoutPanel();   // one radio button per language
     bool loading;
 
@@ -110,6 +112,20 @@ internal sealed class PatchWindow : Form
             boxes.Add(box);
             rows.Controls.Add(box, 0, r); rows.Controls.Add(hint, 1, r); ++r;
         }
+        // FMV volume: a slider row under the check boxes.
+        {
+            var label = new Label { Text = "FMV Volume", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(Px(3), Px(4), Px(14), Px(2)) };
+            videoVolume.Name = "VideoVolumeBar"; videoVolume.Minimum = 0; videoVolume.Maximum = 100; videoVolume.TickFrequency = 10; videoVolume.SmallChange = 5; videoVolume.LargeChange = 10;
+            videoVolume.Value = 100; videoVolume.AutoSize = false; videoVolume.Size = new Size(Px(180), Px(26)); videoVolume.Margin = new Padding(0, 0, Px(8), 0);
+            videoVolumeText.Name = "VideoVolumeText"; videoVolumeText.Text = "100 %"; videoVolumeText.AutoSize = true; videoVolumeText.Anchor = AnchorStyles.Left; videoVolumeText.MinimumSize = new Size(Px(44), 0);
+            var line = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Margin = new Padding(0) };
+            line.Controls.Add(videoVolume); line.Controls.Add(videoVolumeText);
+            var hint = new Label { Text = "Volume of the intro and story videos (.avi and .mp4)", AutoSize = true, ForeColor = SystemColors.GrayText, Anchor = AnchorStyles.Left, Margin = new Padding(0, Px(2), 0, Px(2)) };
+            tips.SetToolTip(videoVolume, "Game/VideoVolume - volume of all videos, 0-100 % of the game's volume");
+            videoVolume.ValueChanged += VideoVolumeChanged;
+            rows.Controls.Add(label, 0, r); rows.Controls.Add(line, 1, r); ++r;
+            rows.Controls.Add(hint, 1, r); ++r;
+        }
         root.Controls.Add(rows);
 
         status.Name = "StatusLabel"; status.AutoSize = true; status.MaximumSize = new Size(wrap, 0); status.ForeColor = SystemColors.GrayText; status.Margin = new Padding(0, 0, 0, gap);
@@ -169,6 +185,9 @@ internal sealed class PatchWindow : Form
         try
         {
             foreach (var box in boxes) { bool v = Installer.ReadOption(folder, (PatchOption)box.Tag); if (box.Checked != v) box.Checked = v; }
+            int volume = Installer.ReadVideoVolume(folder);
+            if (videoVolume.Value != volume) videoVolume.Value = volume;
+            videoVolumeText.Text = volume + " %";
             var available = Installer.AvailableLanguages(folder);
             string current = Installer.ReadLanguage(folder);
             int index = available.FindIndex(n => string.Equals(n, current, StringComparison.OrdinalIgnoreCase));
@@ -198,6 +217,15 @@ internal sealed class PatchWindow : Form
             if (o.Key == "TextureFilter") filter = box;
         }
         if (d3d != null && filter != null) filter.Enabled = d3d.Checked;
+    }
+    void VideoVolumeChanged(object sender, EventArgs e)
+    {
+        videoVolumeText.Text = videoVolume.Value + " %";
+        if (loading) return;
+        if (Installer.SaveVideoVolume(path.Text, videoVolume.Value))
+            status.Text = "Saved: Game/VideoVolume = " + videoVolume.Value + " (takes effect the next time a video plays)";
+        else
+            status.Text = "RoadRashHD.ini does not exist yet; press Install / Update first to set the video volume.";
     }
     void LanguageChanged(object sender, EventArgs e)
     {

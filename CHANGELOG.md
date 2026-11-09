@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.15.0
+
+- **FMV Volume** (`[Game] VideoVolume`, launcher slider): sets the volume of all videos (.avi and .mp4) from 0 to 100 % of the game's volume. The game's audio session volume is scaled while a video plays and restored afterwards.
+- **Fix Bike Colors** (`[Game] FixBikeColors`): the Rat and Super bikes had each other's colours in the race; the 3D bikes now match the showroom. Bug found by Anakin94 / peemosa, fixed here in the DLL without touching the exe.
+
 ## 2.14.2
 
 **New**

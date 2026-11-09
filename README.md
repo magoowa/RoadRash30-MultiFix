@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/logo.png" width="420" alt="Road Rash 30 MultiFix"></p>
 
-<p align="center"><b>v2.14.2</b> &nbsp;|&nbsp; <a href="https://github.com/magoowa/RoadRash30-MultiFix/releases/latest"><b>Download the latest release</b></a> &nbsp;|&nbsp; <a href="CHANGELOG.md">Changelog</a></p>
+<p align="center"><b>v2.15.0</b> &nbsp;|&nbsp; <a href="https://github.com/magoowa/RoadRash30-MultiFix/releases/latest"><b>Download the latest release</b></a> &nbsp;|&nbsp; <a href="CHANGELOG.md">Changelog</a></p>
 
 Fixes, widescreen and a Direct3D 11 renderer for **Road Rash: 30th Anniversary Edition** (GOG, EA app and Steam). Authors: **OBLPlife** (original author) and **magoowa**.
 
@@ -44,6 +44,8 @@ Added in this fork:
 - **No EXE modification:** loads through a `ddraw.dll` proxy; GOG Galaxy "Verify / Repair" does not undo it.
 - **Installer and launcher:** detects GOG, EA app and Steam installations, shows the executable version, has one row per option (read from and saved to `RoadRashHD.ini` live), a **Play** button, detection of the MultiFix installation and its DLL version in the game folder (if it is missing or outdated, Play asks whether to install/update first; Yes or No, the game starts either way), backup/restore, HiDPI-safe layout and a custom icon.
 - **Stutter Fix:** the controller scan that froze the game for ~165 ms every two seconds now runs in the background.
+- **FMV Volume:** a slider in the launcher sets the volume of all intro and story videos (.avi and .mp4), 0-100 %.
+- **Fix Bike Colors:** the Rat and Super bikes have each other's colours in the race (the shop pictures are right); the two groups of five colour tables are swapped back (the same change as Anakin94's fix for the 1996 exe). Thanks to Anakin94 and peemosa for finding the bug.
 - **Fix Text Encoding:** Unicode text the game misreads (the trademark sign shown as `â„¢`, curly quotes, accents) is displayed correctly even with Windows' UTF-8 system code page.
 - **Widescreen game, Alt+Enter / F11:** the whole game runs in widescreen (16:9 window, wide field of view) and a borderless fullscreen toggle is added.
 - **Cleaner textures in Direct3D:** thin far-away strips (water, road) and squeezed textures are averaged instead of aliasing into streaks; sprites are never filtered.
@@ -80,7 +82,9 @@ All options are in `RoadRashHD.ini` (game folder) and in the installer/launcher 
 | `[Input]` | `PadDialogs` | 1 | The controller answers the game's message boxes (A = OK / Yes, B = Cancel / No), for example the quit confirmation. Skipping videos and the Race Resolution dialog work with the controller regardless of this option. |
 | `[Game]` | `FullRateObjects` | 1 | Sprite position interpolation: far riders, cars and pedestrians are updated every frame instead of every 2-8 frames. |
 | `[Game]` | `FixPostcards` | 1 | Repairs the broken left strip of the GAME LOADING picture. |
+| `[Game]` | `FixBikeColors` | 1 | Gives the Rat and Super bikes their correct colours in the race. |
 | `[Game]` | `SkipIntro` | 0 | Skips the studio logos and the intro movie; the menu music still plays. |
+| `[Game]` | `VideoVolume` | 100 | Volume of all videos (.avi and .mp4) in percent of the game's volume (launcher: FMV Volume slider). |
 
 Advanced options, not shown in the launcher (add them to the ini):
 

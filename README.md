@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/logo.png" width="420" alt="Road Rash 30 MultiFix"></p>
 
-<p align="center"><b>v2.14.2</b></p>
+<p align="center"><b>v2.14.2</b> &nbsp;|&nbsp; <a href="https://github.com/magoowa/RoadRash30-MultiFix/releases/latest"><b>Download the latest release</b></a> &nbsp;|&nbsp; <a href="CHANGELOG.md">Changelog</a></p>
 
 Fixes, widescreen and a Direct3D 11 renderer for **Road Rash: 30th Anniversary Edition** (GOG, EA app and Steam). Authors: **OBLPlife** (original author) and **magoowa**.
 
@@ -12,7 +12,7 @@ A GOG-compatible rework of [OBLPlife/RoadRash30th-HD](https://github.com/OBLPlif
 
 ## Install and Restore
 
-1. Build `RoadRash_MultiFix_Setup_v<version>.exe` (see below) and place it in the game folder, next to `RoadRash95.exe`.
+1. Download `RoadRash30-MultiFix_v<version>.zip` from the [latest release](https://github.com/magoowa/RoadRash30-MultiFix/releases/latest) and unpack `RoadRash_MultiFix_Setup_v<version>.exe` (or build it yourself, see below). You can place it in the game folder, next to `RoadRash95.exe`, or run it from anywhere and pick the folder.
 2. Double-click the EXE and select **Install**. If the game is in `C:\Program Files` or `C:\Program Files (x86)`, right-click the EXE and choose **Run as administrator**.
 3. Launch the game as usual (GOG Galaxy or the desktop shortcut). Resolution is detected automatically; adjust it under **Graphics and Sound → Race Resolution** if desired.
 

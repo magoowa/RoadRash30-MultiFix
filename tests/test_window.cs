@@ -46,6 +46,7 @@ internal static class WindowTest
                     throw new InvalidOperationException("Window must offer Install / Update, Restore original and a game folder box");
                 if (window.Icon == null) throw new InvalidOperationException("Installer icon is missing");
                 if (window.Controls.Find("PlayButton", true).Length != 1) throw new InvalidOperationException("Play button is missing");
+                if (window.Controls.Find("LanguageBox", true).Length != 1) throw new InvalidOperationException("Language selector is missing");
                 int options = 0;
                 foreach (Control c in AllControls(window)) if (c.Name.StartsWith("Option_")) ++options;
                 if (options < 10) throw new InvalidOperationException("Expected one row per option, found " + options);

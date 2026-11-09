@@ -115,26 +115,8 @@ static void orientationTests() {
     std::printf("orientation: 60000 cases match original engine vertex order and sprite flips\n");
 }
 
-static void smoothTextTests() {
-    smoothText=true;viewport(1920,1440);
-    std::fill(rgba.begin(),rgba.end(),0x000000u);
-    // A 3x3 white block (source pixels 100..102): its centre must be solid, a far pixel untouched,
-    // and a diagonal step must produce a partially covered (smoothed) pixel at its corner.
-    for(int y=100;y<103;++y)uiSpan(y,100,103,0xffffff);
-    flushUi();
-    int cx=uiX[101]+(uiX[102]-uiX[101])/2,cy=uiY[101]+(uiY[102]-uiY[101])/2;
-    require(rgba[size_t(cy)*width+cx]==0xffffff,"smoothed UI keeps interior pixels solid");
-    require(rgba[size_t(uiY[110])*width+uiX[110]]==0,"smoothed UI leaves distant pixels alone");
-    std::fill(rgba.begin(),rgba.end(),0x000000u);
-    for(int y=200;y<204;++y)uiSpan(y,200,200+(y-199),0xffffff); // staircase
-    flushUi();
-    unsigned partial=0;
-    for(int y=uiY[200];y<uiY[204];++y)for(int x=uiX[200];x<uiX[204];++x){uint32_t v=rgba[size_t(y)*width+x]&255;if(v>16&&v<240)++partial;}
-    require(partial>0,"smoothed UI rounds stair-stepped diagonals");
-    std::printf("smoothing: solid interiors, untouched background and rounded diagonals passed\n");
-}
 int wmain(int argc,wchar_t** argv) {
-    rasterTests();smoothTextTests();require(argc==2,"EXE fixture path");
+    ensureCpuWorld();rasterTests();require(argc==2,"EXE fixture path");
     HMODULE module=LoadLibraryExW(argv[1],nullptr,DONT_RESOLVE_DLL_REFERENCES);
     require(module!=nullptr,"map original executable without executing it");
     base=reinterpret_cast<uintptr_t>(module);
@@ -236,6 +218,7 @@ int wmain(int argc,wchar_t** argv) {
     viewport(3440,1440);horizonWidth=720;horizonRows=320;horizonScroll=123;
     horizon.resize(720*320);
     for(int yy=0;yy<320;++yy)for(int xx=0;xx<720;++xx)horizon[yy*720+xx]=uint8_t(1+xx%250);
+    ensureCpuWorld();   // the indexed world raster is created on first use
     paintBackdrop(low.data(),640);
     for(int xx:{0,1720,3439}) {
         int oldX=int(std::floor((xx+0.5-width/2.0)/sceneScale+320));
@@ -243,7 +226,6 @@ int wmain(int argc,wchar_t** argv) {
     }
     // Finite menu art covers the viewport; all four corner controls stay in the
     // same fitted canvas used by the original mouse-coordinate conversion.
-    smoothText=false; // these checks are about exact coverage; smoothing has its own test
     menuBright.resize(640*480);menuDim.assign(640*480,0x2108);
     for(int yy=0;yy<480;++yy)for(int xx=0;xx<640;++xx)
         menuBright[yy*640+xx]=uint16_t((((xx/20+1)%32)<<10)|(((yy/16+1)%32)<<5)|7);

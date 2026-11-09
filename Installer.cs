@@ -55,13 +55,16 @@ internal static class Installer
         new PatchOption("Input", "AsyncControllerScan", true, "Stutter Fix", "Scans for controllers in the background; removes the periodic 165 ms freeze"),
         new PatchOption("Game", "FullRateObjects", true, "Sprite Position Interpolation", "Updates distant riders, cars and pedestrians every frame instead of every 2-8 frames"),
         new PatchOption("Text", "FixEncoding", true, "Fix Text Encoding", "Fixes Unicode text the game misreads (for example the trademark sign shown as \u00e2\u201e\u00a2)"),
-        new PatchOption("Graphics", "D3D11", true, "Direct3D 11 hardware renderer", "Draws and presents the 3D scene on the GPU; falls back to the CPU renderer if unavailable"),
-        new PatchOption("Graphics", "TextureFilter", true, "Texture filtering (Direct3D only)", "Bilinear filtering of the game's 3D environment (road, buildings, sky); never menus or text"),
+        new PatchOption("Graphics", "D3D11", true, "Direct3D 11 Hardware Renderer", "Draws and presents the 3D scene on the GPU; falls back to the CPU renderer if unavailable"),
+        new PatchOption("Graphics", "TextureFilter", true, "Texture Filtering (Direct3D Only)", "Bilinear filtering of the game's 3D environment (road, buildings, sky); never menus or text"),
         new PatchOption("Graphics", "VSync", false, "VSync", "Waits for the monitor refresh when presenting (off = lowest latency)"),
-        new PatchOption("Window", "WideWindow", true, "Widescreen (16:9) window", "Opens the game in a 16:9 window instead of 4:3"),
-        new PatchOption("Window", "AltEnterFullscreen", true, "Alt+Enter / F11 fullscreen toggle", "Switches between the window and borderless fullscreen"),
-        new PatchOption("Window", "StartFullscreen", false, "Start in fullscreen", "Opens the game in borderless fullscreen"),
-        new PatchOption("Game", "SkipIntro", false, "Skip intro videos", "Skips the studio logos and the intro movie (menu music still starts)"),
+        new PatchOption("Window", "WideWindow", true, "Widescreen (16:9) Game", "Plays the whole game in widescreen (wide field of view) instead of the original 4:3"),
+        new PatchOption("Window", "AltEnterFullscreen", true, "Alt+Enter / F11 Fullscreen Toggle", "Switches between the window and borderless fullscreen"),
+        new PatchOption("Input", "SymmetricSteering", true, "Symmetric Analog Steering", "Controller stick turns right as gently as left (the game made right about twice as sensitive)"),
+        new PatchOption("Input", "PadDialogs", true, "Controller Answers Dialogs", "A = OK / Yes and B = Cancel / No in the game's message boxes (for example when quitting)"),
+        new PatchOption("Window", "AutoHideCursor", true, "Auto-Hide Mouse Cursor", "Hidden at start and after 3 s without mouse movement; returns when you move the mouse"),
+        new PatchOption("Window", "StartFullscreen", true, "Start in Fullscreen", "Opens the game in borderless fullscreen"),
+        new PatchOption("Game", "SkipIntro", false, "Skip Intro Videos", "Skips the studio logos and the intro movie (menu music still starts)"),
     };
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
@@ -259,6 +262,33 @@ internal static class Installer
             return Encoding.ASCII.GetString(data, i + tag.Length, end - i - tag.Length);
         }
         return "";
+    }
+    // Game language: the text DLLs in the game's TEXT folder. "Auto" keeps the game's own choice (registry).
+    public static readonly string[] LanguageNames = { "English", "French", "German", "Italian", "Spanish" };
+    static readonly string[] LanguageFiles = { "ENU.DLL", "FRA.DLL", "DEU.DLL", "ITA.DLL", "ESP.DLL" };
+    public static List<string> AvailableLanguages(string folder)
+    {
+        var list = new List<string> { "Auto" };
+        for (int i = 0; i < LanguageNames.Length; ++i)
+            if (File.Exists(Path.Combine(folder ?? "", "TEXT", LanguageFiles[i]))) list.Add(LanguageNames[i]);
+        return list;
+    }
+    public static string ReadLanguage(string folder)
+    {
+        string ini = Path.Combine(folder ?? "", IniName);
+        if (!File.Exists(ini)) return "Auto";
+        var value = new StringBuilder(32);
+        GetPrivateProfileString("Game", "Language", "Auto", value, 32, ini);
+        return value.ToString();
+    }
+    public static bool SaveLanguage(string folder, string name)
+    {
+        try
+        {
+            string ini = Path.Combine(folder ?? "", IniName);
+            return File.Exists(ini) && WritePrivateProfileString("Game", "Language", name, ini);
+        }
+        catch (Exception) { return false; }
     }
     // Writes one option to RoadRashHD.ini immediately. Returns false when the ini does not exist yet.
     public static bool SaveOption(string folder, PatchOption option, bool value)

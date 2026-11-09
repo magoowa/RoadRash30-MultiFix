@@ -24,7 +24,7 @@ def run(original_dir):
     if folder.parent != build:
         raise RuntimeError('Test directory must be inside build')
     unrelated_cwd = folder / 'unrelated working directory'; unrelated_cwd.mkdir()
-    installer = ROOT / 'dist/RoadRash_MultiFix_Setup.exe'
+    installer = next((ROOT / 'dist').glob('RoadRash_MultiFix_Setup_v*.exe'))
     renderer = (build / 'RoadRashMultiFix.dll').read_bytes()
     proxy = (build / 'ddraw.dll').read_bytes()
     original_exe = (original_dir / 'RoadRash95.exe').read_bytes()

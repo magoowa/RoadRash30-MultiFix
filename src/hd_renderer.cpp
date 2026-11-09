@@ -104,9 +104,36 @@ INT_PTR CALLBACK resolutionDialogProc(HWND window,UINT message,WPARAM wp,LPARAM 
     if(message==WM_CLOSE){EndDialog(window,IDCANCEL);return TRUE;}
     return FALSE;
 }
+// While one of our own dialogs or a message box is open the controller belongs to that dialog: the game's menu
+// keeps polling the pad inside the nested message loop and would act on the same button press (it opened the
+// Race Resolution dialog a second time and could not be closed with the pad). The game's XInputGetState
+// (IAT 0x61c970) reports a pad with nothing pressed while padBlock is set.
+struct PadDialogState{DWORD thread;volatile LONG done;};
+DWORD WINAPI padDialogThread(LPVOID context);
+// XInput, loaded on demand for the helper threads (the game itself uses its own XInput 9.1.0 import).
+struct XInputPad{DWORD packet;WORD buttons;BYTE lt,rt;SHORT lx,ly,rx,ry;};   // XINPUT_STATE
+DWORD (WINAPI* xinputGetState())(DWORD,void*) {
+    static DWORD (WINAPI* function)(DWORD,void*)=nullptr;static bool tried=false;
+    if(!tried){tried=true;for(const char* name:{"xinput1_4.dll","xinput1_3.dll","xinput9_1_0.dll"}){
+        HMODULE module=LoadLibraryA(name);
+        if(module){function=reinterpret_cast<DWORD(WINAPI*)(DWORD,void*)>(GetProcAddress(module,"XInputGetState"));if(function)break;}}}
+    return function;
+}
+volatile LONG padBlock=0;
+DWORD (WINAPI* originalXInputGetState)(DWORD,void*)=nullptr;
+DWORD WINAPI xinputGetStateHook(DWORD user,void* state) {
+    if(padBlock){if(state)std::memset(state,0,16);return 0;}   // XINPUT_STATE is 16 bytes; 0 = ERROR_SUCCESS
+    return originalXInputGetState(user,state);
+}
 int __cdecl resolutionMenuHook() {
+    static bool open=false;static DWORD closedAt=0;
+    // Not re-entrant, and not again right after it was closed (a button still held would open it again).
+    if(open || GetTickCount()-closedAt<700)return 0;
     HWND owner=at<HWND>(0x5ce858);RECT r{};
     if(!owner || !GetClientRect(owner,&r) || r.right<=0 || r.bottom<=0)return 0;
+    open=true;InterlockedIncrement(&padBlock);
+    PadDialogState padState{GetCurrentThreadId(),0};
+    HANDLE padThread=CreateThread(nullptr,0,padDialogThread,&padState,0,nullptr);   // the pad operates the dialog
     ResolutionDialog dialog{r.right,r.bottom,resolutionChoices(r.right,r.bottom,renderHeight)};
     if(DialogBoxParamW(rendererModule,MAKEINTRESOURCEW(101),owner,resolutionDialogProc,reinterpret_cast<LPARAM>(&dialog))==IDOK && dialog.chosen>=0) {
         renderHeight=dialog.choices[dialog.chosen].height;
@@ -116,6 +143,9 @@ int __cdecl resolutionMenuHook() {
         fn<void(__fastcall*)(int)>(0x45bd20)(1);
         InvalidateRect(owner,nullptr,FALSE);
     }
+    InterlockedExchange(&padState.done,1);
+    if(padThread){WaitForSingleObject(padThread,1000);CloseHandle(padThread);}
+    InterlockedDecrement(&padBlock);open=false;closedAt=GetTickCount();
     return 0;
 }
 // Window management. The game opens a 4:3 window; the renderer already follows
@@ -179,7 +209,61 @@ void closeGame(HWND window) {
     PostMessageW(window,WM_CLOSE,0,0);
     if(!armed){armed=true;HANDLE h=CreateThread(nullptr,0,forceExitThread,nullptr,0,nullptr);if(h)CloseHandle(h);}
 }
+// Auto-hide the mouse cursor: hidden from the start, shown as soon as the mouse moves or a button is pressed,
+// hidden again after a few seconds without mouse movement.
+bool autoHideCursor=true,cursorHidden=false;
+DWORD lastMouseActivity=0;POINT lastMousePoint{-1,-1};
+constexpr UINT_PTR kCursorTimer=0x5252;
+void showCursorAgain(HWND window) {
+    if(!cursorHidden)return;
+    cursorHidden=false;
+    HCURSOR cursor=reinterpret_cast<HCURSOR>(GetClassLongPtrA(window,GCLP_HCURSOR));
+    SetCursor(cursor?cursor:LoadCursorA(nullptr,IDC_ARROW));
+}
+// The game sets its own cursor all the time (a wait cursor and the arrow again when a menu or a character
+// changes), which made a hidden cursor flash. While the cursor is hidden those SetCursor calls are ignored.
+// A modal dialog (Save as..., message boxes) disables the game window: the cursor is shown then.
+HCURSOR WINAPI setCursorHook(HCURSOR cursor) {
+    if(autoHideCursor && cursorHidden && (!hookedWindow || IsWindowEnabled(hookedWindow)))return nullptr;
+    return SetCursor(cursor);
+}
+// The cursor is hidden from the moment the game creates its window ("RashRoot"), not from the first rendered
+// frame: the start-up logos and loading screens run before that.
+using CreateWindowFn=HWND(WINAPI*)(DWORD,LPCSTR,LPCSTR,DWORD,int,int,int,int,HWND,HMENU,HINSTANCE,LPVOID);
+CreateWindowFn originalCreateWindow=nullptr;
+HWND WINAPI createWindowHook(DWORD exStyle,LPCSTR className,LPCSTR title,DWORD style,int x,int y,int w,int h,HWND parent,HMENU menu,HINSTANCE instance,LPVOID param) {
+    HWND window=originalCreateWindow(exStyle,className,title,style,x,y,w,h,parent,menu,instance,param);
+    if(window && autoHideCursor && !IS_INTRESOURCE(className) && std::strcmp(className,"RashRoot")==0) {
+        SetClassLongPtrA(window,GCLP_HCURSOR,0);   // no class cursor to bring the arrow back
+        cursorHidden=true;SetCursor(nullptr);
+    }
+    return window;
+}
 LRESULT CALLBACK renderWindowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
+    if(autoHideCursor && cursorHidden && !IsWindowEnabled(window))showCursorAgain(window);
+    if(autoHideCursor) {
+        switch(message) {
+        case WM_MOUSEMOVE: {
+            POINT p{short(LOWORD(lp)),short(HIWORD(lp))};
+            if(std::abs(p.x-lastMousePoint.x)>1 || std::abs(p.y-lastMousePoint.y)>1){lastMousePoint=p;lastMouseActivity=GetTickCount();showCursorAgain(window);}
+            break;}
+        case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_MOUSEWHEEL:
+            lastMouseActivity=GetTickCount();showCursorAgain(window);break;
+        case WM_KILLFOCUS: case WM_NCMOUSEMOVE: showCursorAgain(window);break;
+        case WM_SETCURSOR:
+            if(cursorHidden && LOWORD(lp)==HTCLIENT){SetCursor(nullptr);return TRUE;}
+            break;
+        case WM_TIMER:
+            if(wp==kCursorTimer) {
+                if(!cursorHidden && IsWindowEnabled(window) && GetTickCount()-lastMouseActivity>=3000 && GetForegroundWindow()==window) {
+                    POINT cursor{};RECT client{};
+                    if(GetCursorPos(&cursor) && ScreenToClient(window,&cursor) && GetClientRect(window,&client) && PtInRect(&client,cursor)){cursorHidden=true;SetCursor(nullptr);}
+                }
+                return 0;
+            }
+            break;
+        }
+    }
     if(message==WM_SYSKEYDOWN && wp==VK_F4 && (lp&(1<<29))){closeGame(window);return 0;}
     if(windowAltEnter) {
         // Alt+Enter (and F11) switch between the window and borderless fullscreen.
@@ -200,6 +284,15 @@ void hookWindow(HWND window) {
     if(!window || hookedWindow==window)return;
     auto previous=reinterpret_cast<WNDPROC>(SetWindowLongPtrA(window,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(&renderWindowProc)));
     if(previous){hookedWindow=window;previousWindowProc=previous;}
+    if(previous && autoHideCursor) {
+        // Start hidden. The mouse position at this moment counts as "not moved" (Windows sends a synthetic
+        // WM_MOUSEMOVE when a window appears under the cursor), so only real movement brings the cursor back.
+        POINT cursor{};RECT client{};
+        lastMouseActivity=GetTickCount();
+        if(GetCursorPos(&cursor) && ScreenToClient(window,&cursor)){lastMousePoint=cursor;
+            if(GetClientRect(window,&client) && PtInRect(&client,cursor)){cursorHidden=true;SetCursor(nullptr);}}
+        SetTimer(window,kCursorTimer,300,nullptr);
+    }
     if(previous) {
         // Applied to every window the game creates (it re-creates its window when it changes mode).
         static HWND placedWindow=nullptr;
@@ -225,66 +318,16 @@ void hookWindow(HWND window) {
     logWindow(window);
 }
 
-struct RasterJob {Vertex points[4];Texture texture;uint8_t color;size_t snapshot=SIZE_MAX;uint16_t id=0;Vertex legacy[4];bool hasLegacy=false;uint8_t alpha=255;};
+struct RasterJob {Vertex points[4];Texture texture;uint8_t color;size_t snapshot=SIZE_MAX;Vertex legacy[4];bool hasLegacy=false;};
 std::vector<RasterJob> rasterJobs,frameJobs;
-// Texture filtering: owner[] records which textured quad last wrote each pixel
-// of the indexed world; the colour pass in compose() then smooths exactly those.
-std::vector<uint16_t> owner;
-bool filterTextures=true,filteredPass=false;
-// Far geometry fades in on the screen, not per object. The game builds several draw lists per frame from a
-// fixed pool of 250 polygon slots that are re-assigned to different polygons every frame, so nothing in a list
-// has an identity that survives from one frame to the next. What does not change is where the far end of the
-// world is: ground-level things that are far away have their lowest edge just below the horizon line (screen
-// y of a ground point is proportional to 1/depth). Quads whose lowest edge is within kFadeRamp logical rows
-// below the horizon are drawn with opacity growing from 0 to 1 over that band, so everything that appears at
-// the far end (cliff pieces, trees, signs, riders) rises out of the distance instead of popping.
-bool fadeFar=true;
-unsigned long long motionFrame=0;
-bool drawLog=false;FILE* drawFile=nullptr;   // [Debug] DrawLog=1: what the game puts into the draw list, frame by frame
-int fadeCall=0;unsigned long long fadeLastFrame=0;
-constexpr double kFadeRamp=16.0;   // logical (480-row) pixels
-double fadeHorizonRow=-1;          // output row of the horizon line, -1 = unknown
-int fadeAlphaFor(double feet,double scale) {
-    if(fadeHorizonRow<0)return 255;
-    double t=(feet-fadeHorizonRow)/(kFadeRamp*scale);
-    if(t<-0.08)return 255;        // entirely above the horizon: sky-high scenery, never faded
-    if(t>=1)return 255;
-    if(t<0)t=0;
-    return std::max(1,int(t*t*(3-2*t)*255.0+0.5));
-}
-// Called once per draw list before it is consumed.
-void fadePrepare(uint8_t* head) {
-    if(motionFrame!=fadeLastFrame)fadeCall=0;else ++fadeCall;
-    fadeLastFrame=motionFrame;
-    if(drawLog && drawFile && motionFrame<2500) {
-        size_t total=0;for(uint8_t* n=head;n;n=*reinterpret_cast<uint8_t**>(n))++total;
-        std::fprintf(drawFile,"F,%llu,call=%d,total=%zu,snapshot=%d,camera=%d,horizon=%d+%d\n",
-            motionFrame,fadeCall,total,at<int>(0x5c55d8),at<int>(0x603714),horizonY,horizonRows);
-        for(uint8_t* n=head;n;n=*reinterpret_cast<uint8_t**>(n)) {
-            auto res=*reinterpret_cast<uint8_t**>(n+4);
-            const int* v=reinterpret_cast<const int*>(n+0x18);   // x0,y0 .. x3,y3 in the game's 640x480 space
-            std::fprintf(drawFile,"N,%p,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",static_cast<void*>(res),
-                res?*reinterpret_cast<int*>(res+12):-1,v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7]);
-        }
-        std::fflush(drawFile);
-    }
-}
-unsigned nextJobId=1;
-const uint32_t* filterPalette=nullptr;
+// The indexed world raster (1 B per pixel) belongs to the CPU renderer only. With Direct3D it would just sit in
+// memory (about 8 MB at 4K), so it is created on first use.
+bool cpuWorld=false;
+void ensureCpuWorld();
 std::vector<uint8_t> textureSnapshots;
 void enqueueQuad(const Vertex (&points)[4],Texture texture,uint8_t color,bool changing=false,const Vertex* logical=nullptr) {
     RasterJob job{};std::memcpy(job.points,points,sizeof job.points);job.texture=texture;job.color=color;
     if(logical){for(int i=0;i<4;++i)job.legacy[i]={logical[i].x,logical[i].y,points[i].u,points[i].v};job.hasLegacy=true;}
-    if(filterTextures && texture.pixels && nextJobId<65535) {
-        // Bilinear filtering only matters when a texture is magnified. Distant, minified
-        // quads keep the nearest sample (and cost nothing here).
-        double area=0,umin=points[0].u,umax=umin,vmin=points[0].v,vmax=vmin;
-        for(int i=0;i<4;++i) {
-            const auto& a=points[i];const auto& b=points[(i+1)&3];area+=a.x*b.y-b.x*a.y;
-            umin=std::min(umin,a.u);umax=std::max(umax,a.u);vmin=std::min(vmin,a.v);vmax=std::max(vmax,a.v);
-        }
-        if(std::abs(area)*0.5>=(umax-umin)*(vmax-vmin)*1.4)job.id=uint16_t(nextJobId++);
-    }
     if(changing && texture.pixels) {
         double ul=points[0].u,ur=ul,vt=points[0].v,vb=vt;
         for(const auto& p:points){ul=std::min(ul,p.u);ur=std::max(ur,p.u);vt=std::min(vt,p.v);vb=std::max(vb,p.v);}
@@ -304,7 +347,7 @@ void enqueueQuad(const Vertex (&points)[4],Texture texture,uint8_t color,bool ch
 }
 // Disjoint row strips preserve the original draw order at every pixel. Sprite
 // images modified by the engine are snapshotted before workers start reading.
-void (*workerRows)(int,int)=nullptr;
+void (*workerRows)(int,int)=nullptr;   // when set, the workers run this instead of drawing quads
 struct RasterWorkers {
     struct Strip {int index;RasterWorkers* owner;PTP_WORK work;};
     std::array<Strip,64> strips{};int count=0;
@@ -312,13 +355,7 @@ struct RasterWorkers {
         auto s=static_cast<Strip*>(context);
         int top=height*s->index/s->owner->count,bottom=height*(s->index+1)/s->owner->count;
         if(workerRows){workerRows(top,bottom);return;}
-        if(filteredPass) {
-            for(const auto& job:frameJobs)if(job.id)
-                rrhd::quadFiltered(rgba.data(),owner.data(),job.id,width,height,job.points,job.texture,filterPalette,top,bottom);
-            return;
-        }
-        uint16_t* own=filterTextures?owner.data():nullptr;
-        for(const auto& job:rasterJobs)rrhd::quad(world.data(),width,height,job.points,job.texture,job.color,top,bottom,own,job.id);
+        for(const auto& job:rasterJobs)rrhd::quad(world.data(),width,height,job.points,job.texture,job.color,top,bottom);
     }
     void initialize() {
         // Several strips per core: the bottom of the screen (road, close sprites) is far
@@ -331,8 +368,7 @@ struct RasterWorkers {
 void runRasterJobs() {
     for(auto& job:rasterJobs)if(job.snapshot!=SIZE_MAX)job.texture.pixels=textureSnapshots.data()+job.snapshot;
     if(rasterJobs.size()<32 || height<480) {
-        uint16_t* own=filterTextures&&owner.size()==world.size()?owner.data():nullptr;
-        for(const auto& job:rasterJobs)rrhd::quad(world.data(),width,height,job.points,job.texture,job.color,0,0x7fffffff,own,job.id);
+        for(const auto& job:rasterJobs)rrhd::quad(world.data(),width,height,job.points,job.texture,job.color,0,0x7fffffff);
     } else {
         if(!rasterWorkers.count)rasterWorkers.initialize();
         for(int i=0;i<rasterWorkers.count;++i) {
@@ -342,10 +378,8 @@ void runRasterJobs() {
         for(int i=0;i<rasterWorkers.count;++i)if(rasterWorkers.strips[i].work)
             WaitForThreadpoolWorkCallbacks(rasterWorkers.strips[i].work,FALSE);
     }
-    if(filterTextures)frameJobs.insert(frameJobs.end(),rasterJobs.begin(),rasterJobs.end());
-    rasterJobs.clear();if(!filterTextures)textureSnapshots.clear();
+    rasterJobs.clear();textureSnapshots.clear();
 }
-// Colour pass over the textured quads of this frame (palette is known only at present time).
 // Run fn(top,bottom) over disjoint output-row strips on the worker pool.
 void parallelRows(void (*fn)(int,int)) {
     if(height<480){fn(0,height);return;}
@@ -359,24 +393,6 @@ void parallelRows(void (*fn)(int,int)) {
         WaitForThreadpoolWorkCallbacks(rasterWorkers.strips[i].work,FALSE);
     workerRows=nullptr;
 }
-void runFilteredPass(const uint32_t* colors) {
-    if(!filterTextures || frameJobs.empty() || owner.size()!=world.size() || rgba.size()!=world.size())return;
-    for(auto& job:frameJobs)if(job.snapshot!=SIZE_MAX)job.texture.pixels=textureSnapshots.data()+job.snapshot;
-    filterPalette=colors;filteredPass=true;
-    if(frameJobs.size()<32 || height<480) {
-        for(const auto& job:frameJobs)if(job.id)
-            rrhd::quadFiltered(rgba.data(),owner.data(),job.id,width,height,job.points,job.texture,colors);
-    } else {
-        if(!rasterWorkers.count)rasterWorkers.initialize();
-        for(int i=0;i<rasterWorkers.count;++i) {
-            auto& s=rasterWorkers.strips[i];
-            if(s.work)SubmitThreadpoolWork(s.work);else RasterWorkers::render(nullptr,&s,nullptr);
-        }
-        for(int i=0;i<rasterWorkers.count;++i)if(rasterWorkers.strips[i].work)
-            WaitForThreadpoolWorkCallbacks(rasterWorkers.strips[i].work,FALSE);
-    }
-    filteredPass=false;
-}
 
 void status(const char* message) {
     if(logPath.empty()) return;
@@ -388,9 +404,8 @@ void status(const char* message) {
 // intervals, which is what a viewer perceives as stutter.
 bool profileEnabled=false;
 bool gpuFrame=false,fixPostcards=true;
-bool asyncControllerScan=true,fixTextEncoding=true,smoothText=true,skipIntro=false,fullRateObjects=true;
+bool asyncControllerScan=true,fixTextEncoding=true,skipIntro=false,fullRateObjects=true;
 int dumpEverySeconds=0,dumpScale=2;
-bool motionLog=false;FILE* motionFile=nullptr;
 void logWindow(HWND window) {
     if(!profileEnabled)return;
     RECT w{},c{};GetWindowRect(window,&w);GetClientRect(window,&c);
@@ -398,7 +413,7 @@ void logWindow(HWND window) {
         GetWindowLongA(window,GWL_STYLE),GetWindowLongA(window,GWL_EXSTYLE),w.left,w.top,w.right-w.left,w.bottom-w.top,c.right,c.bottom,IsZoomed(window)?1:0,GetMenu(window)?1:0);
     status(m);
 }
-enum Stage {StageBackdrop,StageRaster,StageLegacy,StageCompose,StagePresent,StageMenu,StageMenuBackdrop,StageFilter,StageUi,StageGpu,StageCount};
+enum Stage {StageBackdrop,StageRaster,StageLegacy,StageCompose,StagePresent,StageMenu,StageMenuBackdrop,StageGpu,StageCount};
 // Stall sampler (profile mode only): while the game loop has not presented for
 // 25+ ms, briefly suspend the game thread and log where it is waiting.
 HANDLE watchdogMain=nullptr;
@@ -478,12 +493,8 @@ void dumpFrame(LONGLONG nowTicks) {
     ++saved;
 }
 // Texture filtering exists only in the Direct3D renderer; the CPU/GDI path draws nearest-neighbour.
-bool configFilter=true,configSmooth=false;
+bool configFilter=true;
 bool gameplayFramePresented=false;
-void applyQuality() {
-    filterTextures=false;
-    smoothText=configSmooth;
-}
 struct Profiler {
     LONGLONG stage[StageCount]{},lastPresent=0,reportStart=0,frequency=0,worstRebuild=0;
     unsigned rebuilds=0,slowLogged=0;
@@ -518,12 +529,12 @@ struct Profiler {
             std::snprintf(message,sizeof message,
                 "profile %dx%d: frames %zu; interval ms p50 %.1f p95 %.1f p99 %.1f max %.1f; >20ms %u, >33ms %u; "
                 "avg ms/frame: backdrop %.2f raster %.2f legacy-copy %.2f compose %.2f present %.2f menu %.2f; "
-                "menu backdrop rebuilds %u (worst %.1f ms, total %.1f ms); texture-filter %.2f ui-smooth %.2f gpu-submit %.2f",
+                "menu backdrop rebuilds %u (worst %.1f ms, total %.1f ms); gpu-submit %.2f",
                 width,height,n,sorted[n/2],sorted[std::min(n-1,n*95/100)],sorted[std::min(n-1,n*99/100)],sorted[n-1],slow,veryslow,
                 stage[StageBackdrop]*1000.0/frequency/n,stage[StageRaster]*1000.0/frequency/n,
                 stage[StageLegacy]*1000.0/frequency/n,stage[StageCompose]*1000.0/frequency/n,stage[StagePresent]*1000.0/frequency/n,
                 stage[StageMenu]*1000.0/frequency/n,rebuilds,worstRebuild*1000.0/frequency,stage[StageMenuBackdrop]*1000.0/frequency,
-                stage[StageFilter]*1000.0/frequency/n,stage[StageUi]*1000.0/frequency/n,stage[StageGpu]*1000.0/frequency/n);
+                stage[StageGpu]*1000.0/frequency/n);
             status(message);
         }
         intervals.clear();std::memset(stage,0,sizeof stage);rebuilds=0;worstRebuild=0;reportStart=end;
@@ -560,6 +571,14 @@ bool branch(uintptr_t va,void* target,uint8_t opcode) {
 bool isBranch(uintptr_t va,uint8_t opcode,uintptr_t target) {
     return at<uint8_t>(va)==opcode && uintptr_t(intptr_t(va+5)+at<int32_t>(va+1))==target;
 }
+// Replaces one of the game's imports (the slot at va of its import table). With a module and name given, the slot
+// must still point at that function; the previous value is returned through original.
+bool hookImport(uintptr_t va,const wchar_t* module,const char* name,void* hook,void** original=nullptr) {
+    void* current=at<void*>(va);
+    if(module && current!=reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(module),name)))return false;
+    if(original)*original=current;
+    return writeMemory(base+va-0x400000,&hook,sizeof hook);
+}
 
 // Physical client dimensions, without an aspect whitelist or fixed row table.
 void viewport(int cw,int ch) {
@@ -570,7 +589,8 @@ void viewport(int cw,int ch) {
     sceneScale=h/480.0;sceneOffset=w/2.0-logicalWidth*sceneScale;
     if(w==width && h==height) return;
     width=w;height=h;
-    world.resize(size_t(w)*h);rgba.resize(size_t(w)*h);owner.assign(size_t(w)*h,0);
+    rgba.resize(size_t(w)*h);
+    if(cpuWorld)world.resize(size_t(w)*h);
     baseline.resize(640*480);beforeText.resize(640*480);
     mapX.resize(w);mapY.resize(h);sceneX.resize(640);sceneY.resize(480);
     backdropX.resize(w);panoramaX.resize(w);menuBackdropDirty=true;
@@ -601,10 +621,13 @@ bool windowViewport() {
 bool highMode() {
     return enabled && at<uint8_t>(0x5a292a) && at<int>(0x5a2934)==640 && at<int>(0x5a2938)==480;
 }
+void ensureCpuWorld() {
+    if(cpuWorld)return;
+    cpuWorld=true;world.assign(size_t(width)*height,0);
+}
 void startFrame() {
     frameActive=true;begun=false;worldReady=false;displayReady=false;gpuSceneReady=false;gpuFrame=false;
-    applyQuality();
-    primitives=0;batches=0;frameJobs.clear();textureSnapshots.clear();nextJobId=1;++motionFrame;
+    primitives=0;batches=0;frameJobs.clear();textureSnapshots.clear();
 }
 int __cdecl frameHook() {
     if(!highMode() || !windowViewport()) { worldReady=false;displayReady=false;return fn<DrawList>(0x45ac50)(); }
@@ -655,7 +678,6 @@ void __fastcall horizonDrawHook(int scroll,int y) {
 }
 int wrap(int x,int n) { int r=x%n;return r<0?r+n:r; }
 void paintBackdrop(const uint8_t* pixels,int pitch) {
-    if(filterTextures && owner.size()==world.size())std::fill(owner.begin(),owner.end(),uint16_t(0));
     if(horizonRows>0)for(int x=0;x<width;++x)panoramaX[x]=wrap(backdropX[x]-horizonScroll,horizonWidth);
     int previous=-1;
     for(int y=0;y<height;++y) {
@@ -718,6 +740,7 @@ bool beginWorld() {
         legacyPicture=legacyBackdrop;gpuFrame=true;begun=true;return true;
     }
     gpuFrame=false;
+    ensureCpuWorld();
     LONGLONG t0=profileEnabled?profiler.now():0;
     paintBackdrop(pixels,pitch);profiler.add(StageBackdrop,t0);begun=true;return true;
 }
@@ -737,20 +760,9 @@ void drawNode(uint8_t* node) {
     Vertex logical[4];
     for(int i=0;i<4;++i)logical[i]={p[i].x+320.0-logicalWidth,p[i].y};
     for(auto& v:p)v=vertex(v.x,v.y);
-    const int depth=0;
-    int alpha=255;
-    if(fadeFar&&gpuFrame) {
-        double feet=p[0].y;for(const auto& v:p)feet=std::max(feet,v.y);
-        alpha=fadeAlphaFor(feet,sceneScale);
-    }
-    if(alpha<=0)return;
-    if(motionLog && motionFile) {
-        double cx=0,cy=0,lo=p[0].x,hi=p[0].x;for(auto& v:p){cx+=v.x;cy+=v.y;lo=std::min(lo,v.x);hi=std::max(hi,v.x);}
-        std::fprintf(motionFile,"%llu,%p,%p,%d,%d,%.2f,%.2f,%.1f,%d,%d\n",motionFrame,static_cast<void*>(resource),static_cast<void*>(node),flags,int(flat),cx/4,cy/4,hi-lo,depth,alpha);
-    }
     if(flat) {
         uint8_t color=*reinterpret_cast<int*>(resource)==16?node[60]:resource[44];
-        enqueueQuad(p,{},color,false,logical);rasterJobs.back().alpha=uint8_t(alpha);++primitives;return;
+        enqueueQuad(p,{},color,false,logical);++primitives;return;
     }
     if(flags & 0x2000) fn<Actor>(0x458f30)(node);
     resource=*reinterpret_cast<uint8_t**>(node+4);
@@ -773,7 +785,7 @@ void drawNode(uint8_t* node) {
     if(data) {
         double divisor=double(1<<mip);for(auto& v:p){v.u/=divisor;v.v/=divisor;}
         Texture t{data,std::max(1,tw>>mip),std::max(1,th>>mip),(flags&2)!=0};
-        enqueueQuad(p,t,0,(flags&0x2000)!=0,logical);rasterJobs.back().alpha=uint8_t(alpha);++primitives;
+        enqueueQuad(p,t,0,(flags&0x2000)!=0,logical);++primitives;
     }
 }
 void copyLegacyView() {
@@ -790,8 +802,6 @@ int __cdecl listHook() {
     auto head=at<uint8_t*>(0x6185e0);at<uint8_t*>(0x6185e0)=nullptr;
     int result=fn<DrawList>(0x4688e0)();at<uint8_t*>(0x6185e0)=head;
     if(!beginWorld()) return result;
-    fadeHorizonRow=horizonRows>0?(horizonY+horizonRows)*sceneScale:-1;
-    if(fadeFar||drawLog)fadePrepare(at<uint8_t*>(0x6185e0));
     while(auto node=at<uint8_t*>(0x6185e0)) {
         drawNode(node);at<uint8_t*>(0x6185e0)=*reinterpret_cast<uint8_t**>(node);
     }
@@ -808,95 +818,20 @@ void fillUiSpan(int y,int left,int right,uint32_t color) {
     for(int yy=uiY[y];yy<uiY[y+1];++yy)
         std::fill(rgba.begin()+size_t(yy)*width+x0,rgba.begin()+size_t(yy)*width+x1,color);
 }
-// UI/text smoothing. The game draws text and HUD into the 640x480 picture. Filling
-// every source pixel with a flat block makes it look pixelated at native size.
-// Instead the UI pixels are collected as a mask, and the output pixel's coverage
-// is the bilinear value of that mask, sharpened with a narrow smoothstep: edges
-// stay crisp, but stair-stepped diagonals and corners become smooth contours.
+// UI layer. The game draws text and HUD into the 640x480 picture. With Direct3D the changed pixels are collected as
+// a mask and drawn on top of the scaled scene at present time; the CPU renderer fills them straight into the frame.
 uint8_t uiMask[480*640];uint32_t uiColorBuf[480*640];
-bool uiRowDirty[480];int uiRowMinX[480],uiRowMaxX[480];int uiDirtyMin=480,uiDirtyMax=-1;size_t uiCount=0;
-int uiYBegin=0,uiYEnd=0;
-std::vector<int> uiColIdx,uiRowIdx;std::vector<unsigned> uiColW,uiRowW;int uiGeometryWidth=0,uiGeometryHeight=0;
-void prepareUiGeometry() {
-    if(uiGeometryWidth==width && uiGeometryHeight==height)return;
-    uiGeometryWidth=width;uiGeometryHeight=height;
-    double ui=std::min(width/640.0,height/480.0),ox=(width-640*ui)/2,oy=(height-480*ui)/2;
-    uiColIdx.resize(width);uiColW.resize(width);uiRowIdx.resize(height);uiRowW.resize(height);
-    for(int x=0;x<width;++x){double f=(x+0.5-ox)/ui-0.5;int i=int(std::floor(f));uiColIdx[x]=i;uiColW[x]=unsigned((f-i)*256.0);}
-    for(int y=0;y<height;++y){double f=(y+0.5-oy)/ui-0.5;int i=int(std::floor(f));uiRowIdx[y]=i;uiRowW[y]=unsigned((f-i)*256.0);}
-}
+bool uiRowDirty[480];int uiRowMinX[480],uiRowMaxX[480];int uiDirtyMin=480,uiDirtyMax=-1;
 void uiSpan(int y,int left,int right,uint32_t color) {
-    if(!smoothText && !(gpu.ready() && gpuRequested)){fillUiSpan(y,left,right,color);return;}
+    if(!(gpu.ready() && gpuRequested)){fillUiSpan(y,left,right,color);return;}
     for(int x=left;x<right;++x){uiMask[y*640+x]=1;uiColorBuf[y*640+x]=color;}
     if(!uiRowDirty[y]){uiRowDirty[y]=true;uiRowMinX[y]=left;uiRowMaxX[y]=right;}
     else{uiRowMinX[y]=std::min(uiRowMinX[y],left);uiRowMaxX[y]=std::max(uiRowMaxX[y],right);}
-    uiDirtyMin=std::min(uiDirtyMin,y);uiDirtyMax=std::max(uiDirtyMax,y);uiCount+=right-left;
+    uiDirtyMin=std::min(uiDirtyMin,y);uiDirtyMax=std::max(uiDirtyMax,y);
 }
-void smoothUiRows(int top,int bottom) {
-    int yBegin=std::max(top,uiYBegin),yEnd=std::min(bottom,uiYEnd);
-    for(int yy=yBegin;yy<yEnd;++yy) {
-        int ya=std::clamp(uiRowIdx[yy],0,479),yb=std::clamp(uiRowIdx[yy]+1,0,479);
-        if(!uiRowDirty[ya] && !uiRowDirty[yb])continue;
-        int minX=640,maxX=0;
-        if(uiRowDirty[ya]){minX=std::min(minX,uiRowMinX[ya]);maxX=std::max(maxX,uiRowMaxX[ya]);}
-        if(uiRowDirty[yb]){minX=std::min(minX,uiRowMinX[yb]);maxX=std::max(maxX,uiRowMaxX[yb]);}
-        int xBegin=uiX[std::max(0,minX-1)],xEnd=std::min(width,uiX[std::min(640,maxX+1)]+1);
-        unsigned wy=uiRowW[yy];
-        uint32_t* row=rgba.data()+size_t(yy)*width;
-        const uint8_t* ma=uiMask+ya*640;const uint8_t* mb=uiMask+yb*640;
-        const uint32_t* ca=uiColorBuf+ya*640;const uint32_t* cb=uiColorBuf+yb*640;
-        for(int x=xBegin;x<xEnd;++x) {
-            int xa=std::clamp(uiColIdx[x],0,639),xb=std::clamp(uiColIdx[x]+1,0,639);
-            unsigned m00=ma[xa],m10=ma[xb],m01=mb[xa],m11=mb[xb];
-            unsigned any=m00|m10|m01|m11;
-            if(!any)continue;
-            unsigned wx=uiColW[x];
-            if(m00&m10&m01&m11) { // fully inside the UI: plain bilinear colour
-                row[x]=rrhd::lerp8(rrhd::lerp8(ca[xa],ca[xb],wx),rrhd::lerp8(cb[xa],cb[xb],wx),wy);
-                continue;
-            }
-            unsigned a00=(256-wx)*(256-wy)*m00,a10=wx*(256-wy)*m10,a01=(256-wx)*wy*m01,a11=wx*wy*m11;
-            unsigned total=a00+a10+a01+a11;            // 0..65536
-            int coverage=int(total>>8);                // 0..256
-            int tt=std::clamp((coverage-90)*256/76,0,256);
-            if(tt==0)continue;
-            unsigned r=0,g=0,b=0;
-            const unsigned ws[4]={a00,a10,a01,a11};
-            const uint32_t cs[4]={ca[xa],ca[xb],cb[xa],cb[xb]};
-            for(int k=0;k<4;++k){r+=((cs[k]>>16)&255)*(ws[k]>>4);g+=((cs[k]>>8)&255)*(ws[k]>>4);b+=(cs[k]&255)*(ws[k]>>4);}
-            unsigned div=total>>4;
-            uint32_t color=((r/div)<<16)|((g/div)<<8)|(b/div);
-            row[x]=tt>=256?color:rrhd::lerp8(row[x],color,unsigned(tt));
-        }
-    }
-}
-void flushUiImpl();
 void clearUiMask() {
     for(int y=uiDirtyMin;y<=uiDirtyMax;++y)if(uiRowDirty[y]){std::memset(uiMask+y*640,0,640);uiRowDirty[y]=false;}
-    uiDirtyMin=480;uiDirtyMax=-1;uiCount=0;
-}
-void flushUi() {
-    if(gpu.ready() && gpuRequested)return;   // the Direct3D path draws the UI layer at present time
-    if(!smoothText || uiDirtyMax<0)return;
-    LONGLONG u0=profileEnabled?profiler.now():0;flushUiImpl();profiler.add(StageUi,u0);
-}
-void flushUiImpl() {
-    if(uiCount>640*480*35/100) {
-        // Full-screen overlays (fades, dimming) are not text: keep them as flat runs.
-        for(int y=uiDirtyMin;y<=uiDirtyMax;++y)if(uiRowDirty[y])
-            for(int x=0;x<640;) {
-                if(!uiMask[y*640+x]){++x;continue;}
-                uint32_t c=uiColorBuf[y*640+x];int e=x+1;
-                while(e<640 && uiMask[y*640+e] && uiColorBuf[y*640+e]==c)++e;
-                fillUiSpan(y,x,e,c);x=e;
-            }
-    } else {
-        prepareUiGeometry();
-        uiYBegin=std::max(0,uiY[std::max(0,uiDirtyMin-1)]-1);uiYEnd=std::min(height,uiY[std::min(480,uiDirtyMax+2)]+1);
-        parallelRows(smoothUiRows);
-    }
-    for(int y=uiDirtyMin;y<=uiDirtyMax;++y)if(uiRowDirty[y]){std::memset(uiMask+y*640,0,640);uiRowDirty[y]=false;}
-    uiDirtyMin=480;uiDirtyMax=-1;uiCount=0;
+    uiDirtyMin=480;uiDirtyMax=-1;
 }
 void captionOverlay(const uint32_t* finalText) {
     for(int y=0;y<480;++y) {
@@ -909,7 +844,6 @@ void captionOverlay(const uint32_t* finalText) {
             uiSpan(y,x,end,c);x=end;
         }
     }
-    flushUi();
 }
 const uint32_t* convertColors=nullptr;
 void convertRows(int top,int bottom) {
@@ -931,7 +865,6 @@ void compose(const uint8_t* pixels,int pitch,const uint8_t* palette) {
     } else {
     convertColors=colors;
     parallelRows(convertRows);
-    {LONGLONG f0=profileEnabled?profiler.now():0;runFilteredPass(colors);profiler.add(StageFilter,f0);}
     }
     for(int y=0;y<480;++y) {
         auto src=pixels+size_t(y)*pitch;auto before=baseline.data()+y*640;
@@ -943,7 +876,6 @@ void compose(const uint8_t* pixels,int pitch,const uint8_t* palette) {
             uiSpan(y,x,end,colors[c]);x=end;
         }
     }
-    flushUi();
     displayReady=true;
 }
 void __fastcall present8Hook(const uint8_t* pixels,int pitch,const uint8_t* palette) {
@@ -1063,14 +995,9 @@ void composeMenu(const void* pixels,int pitch,int r,int g,int b) {
     }
     bool dim=dimMatches>brightMatches;
     prepare16(r,g,b);prepareMenuBackdrop(dim);
-    // When the screen is known artwork plus text, keep the artwork alone as the
-    // base so that captionOverlay() sees the text as a separate layer (and can
-    // smooth it). Otherwise (no recognisable artwork) the picture is the base.
-    const auto& art=dim?menuDim:menuBright;
-    bool separateText=smoothText && std::max(brightMatches,dimMatches)>=(30*40)*55/100;
     for(int y=0;y<480;++y)for(int x=0;x<640;++x) {
         size_t i=y*640+x;uint16_t p=reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(pixels)+size_t(y)*pitch)[x];
-        beforeText[i]=color16[separateText?art[i]:p];
+        beforeText[i]=color16[p];
     }
     std::memcpy(rgba.data(),menuBackdrop.data(),rgba.size()*4);
     int previous=-1,left=uiX[0],right=uiX[640];
@@ -1118,13 +1045,14 @@ bool gpuBuildQuads(std::vector<rrhd::GpuQuad>& quads) {
         } else {
             q.flags=4;q.color=job.color;
         }
-        q.flags|=uint32_t(job.alpha)<<8;
+        q.flags|=255u<<8;   // opacity 255 = solid (the shader lowers it for quads thinner than a pixel row)
         quads.push_back(q);
     }
     return true;
 }
 void gpuCompareWithCpu(const std::vector<uint32_t>& gpuPixels) {
     // Reference: the CPU path (indexed raster, nearest) for the same jobs, converted with the same palette.
+    ensureCpuWorld();
     std::vector<uint8_t> savedWorld=world;
     paintBackdrop(legacyBackdrop.data(),640);
     for(const auto& job:frameJobs)
@@ -1176,7 +1104,7 @@ bool gpuPresent() {
     if(uiDirtyMax>=0) {
         static std::vector<uint32_t> layer(640*480);
         for(size_t i=0;i<layer.size();++i)layer[i]=uiMask[i]?(0xff000000u|uiColorBuf[i]):0u;
-        gpu.drawUi(info,layer.data(),!smoothText || uiCount>640*480*35/100); // nearest unless SmoothText=1 (off by default)
+        gpu.drawUi(info,layer.data(),true);   // the UI layer is drawn flat (nearest), never smoothed
         clearUiMask();
     }
     bool ok=gpu.present(gpuVSync);
@@ -1346,9 +1274,35 @@ void __fastcall objectUpdateHook(void* object,int tick,char flag) {
 // thunk at 0x403b2f). A flip-model swap chain owns the window surface, so it is released while
 // a video plays and recreated by the next present.
 using PlayVideo=void(__fastcall*)(const char*,int,int);
+// Skipping a video with the controller. The game's video loop is a blocking GetMessage loop that looks at the
+// pad only when some message arrives, so a button press went unnoticed. While a video plays, a helper thread
+// watches the first XInput pad and posts a key press (Enter) to the game thread, which the loop treats as
+// "skip" (the same as pressing a key). A, B, X, Y, Start or Back skip; a button already held when the video
+// starts counts only after it has been released.
+struct VideoSkipState{DWORD thread;volatile LONG done;};
+DWORD WINAPI videoSkipThread(LPVOID context) {
+    auto* state=static_cast<VideoSkipState*>(context);
+    auto getState=xinputGetState();if(!getState)return 0;
+    const WORD mask=0xf030;   // A B X Y Start Back
+    WORD seenReleased=0,previous=mask;
+    while(!state->done) {
+        Sleep(30);
+        XInputPad pad{};if(getState(0,&pad)!=0)continue;
+        WORD down=WORD(pad.buttons&mask);
+        seenReleased=WORD(seenReleased|(mask&~down));
+        WORD fresh=WORD(down&~previous&seenReleased);
+        previous=down;
+        if(fresh)PostThreadMessageA(state->thread,WM_KEYDOWN,VK_RETURN,0);
+    }
+    return 0;
+}
 void __fastcall playVideoHook(const char* name,int second,int argument) {
     if(gpu.ready()){gpu.releaseWindow();status("video: Direct3D swap chain released");}
+    VideoSkipState skip{GetCurrentThreadId(),0};
+    HANDLE thread=CreateThread(nullptr,0,videoSkipThread,&skip,0,nullptr);
     fn<PlayVideo>(0x410b20)(name,second,argument);
+    InterlockedExchange(&skip.done,1);
+    if(thread){WaitForSingleObject(thread,1000);CloseHandle(thread);}
 }
 
 // Window title: the game sets "Road Rash"; show the mod title with its version instead.
@@ -1385,6 +1339,118 @@ DWORD WINAPI hidScanThread(LPVOID) {
     InterlockedExchange(&hidScanRunning,0);
     return 0;
 }
+// Controller answers message boxes. The game asks its questions (quit, home, ...) with plain Windows message boxes,
+// which a controller cannot operate. While one is open, a helper thread watches the first XInput pad: the D-pad
+// (or left stick) moves between the buttons, A presses the focused button, B answers "Cancel" / "No". A control
+// already held when the box opens is ignored until it has been released, so the press that opened the box does
+// not answer it.
+bool padDialogs=true;
+// The message box is the visible, ENABLED dialog of the game thread: while it is open the dialog it belongs to
+// (the game's own profile / save dialogs are #32770 windows of the same thread) is disabled.
+BOOL CALLBACK findDialog(HWND window,LPARAM lp) {
+    char name[16]{};GetClassNameA(window,name,sizeof name);
+    if(std::strcmp(name,"#32770")==0 && IsWindowVisible(window) && IsWindowEnabled(window)){*reinterpret_cast<HWND*>(lp)=window;return FALSE;}
+    return TRUE;
+}
+// Presses a button the way a mouse click does (it is drawn pressed).
+void pressDialogButton(HWND dialog,int id) {
+    HWND button=GetDlgItem(dialog,id);
+    if(button)PostMessageA(button,BM_CLICK,0,0);else PostMessageA(dialog,WM_COMMAND,WPARAM(id),0);
+}
+DWORD WINAPI padDialogThread(LPVOID context) {
+    auto* state=static_cast<PadDialogState*>(context);
+    auto getState=xinputGetState();if(!getState)return 0;
+    // D-pad / stick left-right moves the focus between the buttons, A presses the focused button, B cancels.
+    // Every control counts only after it has been seen released since the box opened (the press that opened
+    // the box must not answer it).
+    const WORD mask=0x3000|0x000f;   // A, B, D-pad
+    WORD seenReleased=0,previous=mask;
+    while(!state->done) {
+        Sleep(30);
+        XInputPad pad{};if(getState(0,&pad)!=0)continue;
+        WORD down=WORD(pad.buttons&mask);
+        if(pad.lx<-16000)down|=0x0004;else if(pad.lx>16000)down|=0x0008;
+        seenReleased=WORD(seenReleased|(mask&~down));
+        WORD fresh=WORD(down&~previous&seenReleased);   // newly pressed since the last poll
+        previous=down;
+        if(!fresh)continue;
+        HWND dialog=nullptr;EnumThreadWindows(state->thread,findDialog,reinterpret_cast<LPARAM>(&dialog));
+        if(!dialog)continue;
+        GUITHREADINFO info{};info.cbSize=sizeof info;
+        char name[16]{};HWND focus=nullptr;
+        if(GetGUIThreadInfo(state->thread,&info) && info.hwndFocus && IsChild(dialog,info.hwndFocus)){focus=info.hwndFocus;GetClassNameA(focus,name,sizeof name);}
+        bool pickList=focus && (_stricmp(name,"ComboBox")==0 || _stricmp(name,"ListBox")==0);   // up / down change the selection
+        if(pickList && (fresh&(0x0001|0x0002))) {
+            WPARAM key=(fresh&0x0001)?VK_UP:VK_DOWN;
+            PostMessageA(focus,WM_KEYDOWN,key,0);PostMessageA(focus,WM_KEYUP,key,0);
+        }
+        else if(fresh&(0x0004|0x0001))PostMessageA(dialog,WM_NEXTDLGCTL,1,FALSE);   // previous control
+        else if(fresh&(0x0008|0x0002))PostMessageA(dialog,WM_NEXTDLGCTL,0,FALSE);   // next control
+        else if(fresh&0x1000) {
+            if(focus && _stricmp(name,"Button")==0)PostMessageA(focus,BM_CLICK,0,0);
+            else pressDialogButton(dialog,GetDlgItem(dialog,IDYES)?IDYES:IDOK);   // a list is focused: confirm the dialog
+        } else if(fresh&0x2000)
+            pressDialogButton(dialog,GetDlgItem(dialog,IDCANCEL)?IDCANCEL:GetDlgItem(dialog,IDNO)?IDNO:IDOK);
+    }
+    return 0;
+}
+using MessageBoxFn=int(WINAPI*)(HWND,LPCSTR,LPCSTR,UINT);
+MessageBoxFn originalMessageBox=nullptr;
+int WINAPI messageBoxHook(HWND owner,LPCSTR text,LPCSTR caption,UINT type) {
+    if(!padDialogs)return originalMessageBox(owner,text,caption,type);
+    PadDialogState state{GetCurrentThreadId(),0};
+    InterlockedIncrement(&padBlock);
+    HANDLE thread=CreateThread(nullptr,0,padDialogThread,&state,0,nullptr);
+    int result=originalMessageBox(owner,text,caption,type);
+    InterlockedExchange(&state.done,1);
+    if(thread){WaitForSingleObject(thread,1000);CloseHandle(thread);}
+    InterlockedDecrement(&padBlock);
+    return result;
+}
+
+// Game language. 0x43f9f0 reads HKLM\SOFTWARE\Electronic Arts\RoadRash 95 "Language" (English, French, German,
+// Italian or Spanish) and stores 0 / 0x10 / 0x20 / 0x30 / 0x40 (or -1) in 0x595968, which selects the strings in the
+// executable and the Text\XXX.dll resource DLL. Writing HKLM needs administrator rights, so the language can be
+// chosen in RoadRashHD.ini instead ([Game] Language=English|French|German|Italian|Spanish; Auto = registry).
+char languageSetting[16]="Auto";
+int languageCodeOf(const char* name) {
+    static const char* const names[]={"English","French","German","Italian","Spanish"};
+    for(int i=0;i<5;++i)if(_stricmp(name,names[i])==0)return i*0x10;
+    return -1;
+}
+void __cdecl languageHook() {
+    int forced=languageCodeOf(languageSetting);
+    if(forced>=0){at<int>(0x595968)=forced;return;}
+    // Same as the original: the registry decides.
+    HKEY key=nullptr;char value[256]{};DWORD size=255;
+    at<int>(0x595968)=-1;
+    if(RegOpenKeyExA(HKEY_LOCAL_MACHINE,"SOFTWARE\\Electronic Arts\\RoadRash 95",0,KEY_QUERY_VALUE,&key)!=0)return;
+    if(RegQueryValueExA(key,"Language",nullptr,nullptr,reinterpret_cast<BYTE*>(value),&size)==0 && size<0x100)at<int>(0x595968)=languageCodeOf(value);
+    RegCloseKey(key);
+}
+
+// Symmetric analog steering. The joystick layer turns the stick into "action" values in 0x46bea0 (ECX = action,
+// EDX = how far the axis is from its end): for the left action (2) EDX is the raw axis (0..0x6fff) and for the
+// right action (9) it is axis-0x7fff (0x1000..0x8000, the dead zone ends at 0x8fff). It stores EDX/800 in
+// 0x603664 and the steering code (0x41bda0) uses  var-32  for left and  var  for right. Left therefore starts
+// at +3 (slightly right) and reaches -32; right jumps to 5 and reaches 40, so the right turn is about twice as
+// sensitive at half deflection, 25 % stronger at full deflection and has no soft start. Rewriting the mapping so
+// that both sides run from 0 at the end of the dead zone to 32 at full deflection fixes that.
+bool fixSteering=true;
+int __fastcall steerAxisHook(int action,int amount) {
+    if(amount<0)amount=0;
+    if(action==0) {   // accelerate / brake axis: unchanged original behaviour
+        int steerMax=*reinterpret_cast<int*>(at<uint8_t*>(0x5a69ec)+0x260);
+        int value=int(int32_t(uint32_t(steerMax)*uint32_t(amount))/0x7fff);
+        at<int>(0x603660)=value;return value;
+    }
+    if(action==2 || action==9) {
+        double d=action==2?(0x6fff-double(amount))/0x6fff:(double(amount)-0x1000)/(0x8000-0x1000);
+        d=std::max(0.0,std::min(1.0,d));
+        at<int>(0x603664)=int(std::lround(32.0*(action==2?1.0-d:d)));
+    }
+    return 0;
+}
 uint8_t __cdecl hidScanHook() {
     if(hidScanFound)return 1; // The scan already filled in the game's pad state.
     if(InterlockedCompareExchange(&hidScanRunning,1,0)==0) {
@@ -1417,12 +1483,9 @@ bool initialize(HMODULE module) {
     if(!originalStretch)return false;
     bool ok=true;for(auto h:hooks)ok=branch(h.thunk,h.hook,0xe9)&&ok;
     if(fixTextEncoding) {
-        auto loadString=reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"),"LoadStringA"));
-        if(loadString && at<void*>(0x61c788)==loadString) {
-            originalLoadString=at<LoadStringFn>(0x61c788);
-            LoadStringFn hook=&loadStringHook;
-            ok=writeMemory(base+0x21c788,&hook,sizeof hook)&&ok;
-        } else status("text encoding fix skipped: unexpected import table");
+        void* original=nullptr;
+        if(hookImport(0x61c788,L"user32.dll","LoadStringA",reinterpret_cast<void*>(&loadStringHook),&original))originalLoadString=reinterpret_cast<LoadStringFn>(original);
+        else status("text encoding fix skipped: unexpected import table");
     }
     {
         wchar_t script[1024]{};
@@ -1447,19 +1510,42 @@ bool initialize(HMODULE module) {
             if(isBranch(thunk,0xe9,0x449bb0))ok=branch(thunk,reinterpret_cast<void*>(&objectUpdateHook),0xe9)&&ok;
     }
     {
-        auto setText=reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"),"SetWindowTextA"));
-        if(setText && at<void*>(0x61c6dc)==setText) {
-            originalSetWindowText=at<SetWindowTextFn>(0x61c6dc);SetWindowTextFn hook=&setWindowTextHook;
-            ok=writeMemory(base+0x21c6dc,&hook,sizeof hook)&&ok;
-        }
+        void* original=nullptr;
+        if(hookImport(0x61c6dc,L"user32.dll","SetWindowTextA",reinterpret_cast<void*>(&setWindowTextHook),&original))originalSetWindowText=reinterpret_cast<SetWindowTextFn>(original);
     }
-    if(gpuRequested && isBranch(0x403b2f,0xe9,0x410b20))ok=branch(0x403b2f,reinterpret_cast<void*>(&playVideoHook),0xe9)&&ok;
+    if(isBranch(0x403b2f,0xe9,0x410b20))ok=branch(0x403b2f,reinterpret_cast<void*>(&playVideoHook),0xe9)&&ok;   // pad skip, and the swap chain release with Direct3D
     if(skipIntro) {
         const uintptr_t sites[]={0x461188,0x461196,0x4611a4};
         bool match=true;
         for(auto s:sites)match=match && at<uint8_t>(s)==0xe8 && uintptr_t(intptr_t(s+5)+at<int32_t>(s+1))==0x403b2f;
         if(match){for(auto s:sites)ok=branch(s,reinterpret_cast<void*>(&skipIntroVideo),0xe8)&&ok;}
         else status("skip intro ignored: unexpected start-up code");
+    }
+    if(languageCodeOf(languageSetting)>=0) {
+        const uint8_t expect[6]={0x55,0x8b,0xec,0x81,0xec,0x0c};
+        bool match=true;for(int i=0;i<6;++i)match=match && at<uint8_t>(0x43f9f0+i)==expect[i];
+        if(match)ok=branch(0x43f9f0,reinterpret_cast<void*>(&languageHook),0xe9)&&ok;
+        else status("language setting ignored: unexpected start-up code");
+    }
+    if(autoHideCursor) {
+        void* original=nullptr;
+        if(hookImport(0x61c6f8,L"user32.dll","CreateWindowExA",reinterpret_cast<void*>(&createWindowHook),&original))originalCreateWindow=reinterpret_cast<CreateWindowFn>(original);
+        hookImport(0x61c714,L"user32.dll","SetCursor",reinterpret_cast<void*>(&setCursorHook));
+    }
+    {
+        void* original=nullptr;   // the game's own XInputGetState import (it reports a pad with nothing pressed while a dialog is open)
+        if(!originalXInputGetState && hookImport(0x61c970,nullptr,nullptr,reinterpret_cast<void*>(&xinputGetStateHook),&original))originalXInputGetState=reinterpret_cast<decltype(originalXInputGetState)>(original);
+    }
+    if(padDialogs) {
+        void* original=nullptr;
+        if(hookImport(0x61c6a4,L"user32.dll","MessageBoxA",reinterpret_cast<void*>(&messageBoxHook),&original))originalMessageBox=reinterpret_cast<MessageBoxFn>(original);
+        else status("controller dialogs ignored: unexpected import table");
+    }
+    if(fixSteering) {
+        const uint8_t expect[8]={0x33,0xc0,0x85,0xd2,0x0f,0x48,0xd0,0x2b};
+        bool match=true;for(int i=0;i<8;++i)match=match && at<uint8_t>(0x46bea0+i)==expect[i];
+        if(match)ok=branch(0x46bea0,reinterpret_cast<void*>(&steerAxisHook),0xe9)&&ok;
+        else status("symmetric steering ignored: unexpected input code");
     }
     // Optional: only when the call site matches exactly (and the user did not opt out).
     if(asyncControllerScan && at<uint8_t>(0x463961)==0xe8 &&
@@ -1485,10 +1571,13 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     renderHeight=GetPrivateProfileIntW(L"Graphics",L"RenderHeight",0,configPath.c_str());
     profileEnabled=GetPrivateProfileIntW(L"Graphics",L"Profile",0,configPath.c_str())!=0;
     asyncControllerScan=GetPrivateProfileIntW(L"Input",L"AsyncControllerScan",1,configPath.c_str())!=0;
+    fixSteering=GetPrivateProfileIntW(L"Input",L"SymmetricSteering",1,configPath.c_str())!=0;
+    padDialogs=GetPrivateProfileIntW(L"Input",L"PadDialogs",1,configPath.c_str())!=0;
+    {wchar_t language[16]{};GetPrivateProfileStringW(L"Game",L"Language",L"Auto",language,16,configPath.c_str());
+     for(int i=0;i<15;++i)languageSetting[i]=char(language[i]);languageSetting[15]=0;}
     fixTextEncoding=GetPrivateProfileIntW(L"Text",L"FixEncoding",1,configPath.c_str())!=0;
     gpuRequested=GetPrivateProfileIntW(L"Graphics",L"D3D11",1,configPath.c_str())!=0;
     configFilter=gpuRequested && GetPrivateProfileIntW(L"Graphics",L"TextureFilter",1,configPath.c_str())!=0;
-    configSmooth=GetPrivateProfileIntW(L"Graphics",L"SmoothText",0,configPath.c_str())!=0;
     gpuVSync=GetPrivateProfileIntW(L"Graphics",L"VSync",0,configPath.c_str())!=0?1:0;
     gpuCompare=GetPrivateProfileIntW(L"Debug",L"CompareGpu",0,configPath.c_str())!=0;
     gpu.log=&status;
@@ -1510,19 +1599,14 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
         }
         if(wineVersion){std::string m=std::string("running under Wine ")+wineVersion()+(gpu.useChildWindow?" (Direct3D surface: child window)":" (Direct3D surface: game window)");status(m.c_str());}
     }
-    applyQuality();
     skipIntro=GetPrivateProfileIntW(L"Game",L"SkipIntro",0,configPath.c_str())!=0;
     fixPostcards=GetPrivateProfileIntW(L"Game",L"FixPostcards",1,configPath.c_str())!=0;
     fullRateObjects=GetPrivateProfileIntW(L"Game",L"FullRateObjects",1,configPath.c_str())!=0;
-    fadeFar=false;
     dumpEverySeconds=GetPrivateProfileIntW(L"Graphics",L"DumpFrameEverySeconds",0,configPath.c_str());
     dumpScale=GetPrivateProfileIntW(L"Graphics",L"DumpScale",2,configPath.c_str());
-    drawLog=GetPrivateProfileIntW(L"Debug",L"DrawLog",0,configPath.c_str())!=0;
-    if(drawLog){std::wstring dp=logPath.substr(0,logPath.find_last_of(L'\\')+1)+L"RoadRashHD_draw.csv";_wfopen_s(&drawFile,dp.c_str(),L"w");}
-    motionLog=GetPrivateProfileIntW(L"Debug",L"MotionLog",0,configPath.c_str())!=0;
-    if(motionLog){std::wstring mp=logPath.substr(0,logPath.find_last_of(L'\\')+1)+L"RoadRashHD_motion.csv";_wfopen_s(&motionFile,mp.c_str(),L"w");}
     windowAltEnter=GetPrivateProfileIntW(L"Window",L"AltEnterFullscreen",1,configPath.c_str())!=0;
-    startFullscreen=GetPrivateProfileIntW(L"Window",L"StartFullscreen",0,configPath.c_str())!=0;
+    autoHideCursor=GetPrivateProfileIntW(L"Window",L"AutoHideCursor",1,configPath.c_str())!=0;
+    startFullscreen=GetPrivateProfileIntW(L"Window",L"StartFullscreen",1,configPath.c_str())!=0;
     windowWidth=GetPrivateProfileIntW(L"Window",L"Width",0,configPath.c_str());
     windowHeight=GetPrivateProfileIntW(L"Window",L"Height",0,configPath.c_str());
     if(!GetPrivateProfileIntW(L"Window",L"WideWindow",1,configPath.c_str()))windowWidth=windowHeight=-1;

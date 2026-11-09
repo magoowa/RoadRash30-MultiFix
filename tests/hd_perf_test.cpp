@@ -8,7 +8,7 @@ static int WINAPI discard(HDC,int,int,int,int,int,int,int,int sh,const void*,con
 int wmain(int argc,wchar_t** argv){
  if(argc!=2)return 2;
  HMODULE exe=LoadLibraryExW(argv[1],nullptr,DONT_RESOLVE_DLL_REFERENCES);if(!exe)return 3;base=reinterpret_cast<uintptr_t>(exe);
- viewport(3440,1440);startFrame();
+ viewport(3440,1440);ensureCpuWorld();startFrame();
  std::vector<uint8_t> low(640*480,9);at<uint8_t*>(0x6036bc)=low.data();at<int>(0x6036b8)=640;
  horizonWidth=720;horizonRows=320;horizon.resize(720*320);
  for(size_t i=0;i<horizon.size();++i)horizon[i]=uint8_t(i%250+1);
@@ -18,7 +18,7 @@ int wmain(int argc,wchar_t** argv){
  std::vector<uint16_t> menu(640*480,0x4210);menuBright=menu;menuDim.assign(640*480,0x2108);
  std::array<double,7> sum{};
  for(int frame=0;frame<25;++frame){
-  frameJobs.clear();textureSnapshots.clear();nextJobId=1;
+  frameJobs.clear();textureSnapshots.clear();
   auto a=Clock::now();paintBackdrop(low.data(),640);auto b=Clock::now();
   for(int n=0;n<489;++n){double y=200+(n%40)*26,x=(n*71)%3440,w=80+(n%20)*16,h=60+(n%10)*20;
    Vertex q[4]={{x,y,0,0},{x+w,y+6,256,0},{x+w-10,y+h,256,256},{x-8,y+h,0,256}};

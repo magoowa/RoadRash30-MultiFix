@@ -44,26 +44,29 @@ def build(vcvarsall, tests):
                 'build\\compile_shaders.exe build\\hd_shaders.inc', 'if errorlevel 1 exit /b 1',
                 'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /I build /LD src\\hd_renderer.cpp '
                 '/Fo:build\\hd_renderer.obj /Fe:build\\RoadRashMultiFix.dll /link /Brepro '
-                '/DEF:src\\hd_renderer.def build\\hd_menu.res user32.lib gdi32.lib', 'if errorlevel 1 exit /b 1',
+                '/DEF:src\\hd_renderer.def build\\hd_menu.res user32.lib gdi32.lib advapi32.lib', 'if errorlevel 1 exit /b 1',
                 'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /LD src\\ddraw_proxy.cpp '
                 '/Fo:build\\ddraw_proxy.obj /Fe:build\\ddraw.dll /link /Brepro '
                 '/DEF:src\\ddraw_proxy.def user32.lib', 'if errorlevel 1 exit /b 1']
     if tests:
         for name in ['hd_test', 'hd_loader_test', 'hd_perf_test', 'hd_animation_test', 'hd_gpu_test']:
             commands.extend([f'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /I build tests\\{name}.cpp '
-                             f'/Fo:build\\{name}.obj /Fe:build\\{name}.exe /link user32.lib gdi32.lib',
+                             f'/Fo:build\\{name}.obj /Fe:build\\{name}.exe /link user32.lib gdi32.lib advapi32.lib',
                              'if errorlevel 1 exit /b 1'])
     commands.append('exit /b 0')
     batch = work / 'compile.cmd'
     batch.write_text('\n'.join(commands) + '\n', encoding='utf-8', newline='\r\n')
     subprocess.run(['cmd.exe', '/d', '/c', str(batch)], check=True)
     csc = Path(os.environ.get('WINDIR', r'C:\Windows')) / 'Microsoft.NET/Framework/v4.0.30319/csc.exe'
-    exe = ROOT / 'dist/RoadRash_MultiFix_Setup.exe'
+    exe = ROOT / ('dist/RoadRash_MultiFix_Setup_v%s.exe' % version)
+    for old in exe.parent.glob('RoadRash_MultiFix_Setup*.exe'):
+        old.unlink()
     subprocess.run([str(csc), '/nologo', '/target:winexe', '/platform:anycpu', '/optimize+', '/utf8output', '/win32icon:' + str(ROOT / 'app.ico'),
                     '/out:' + str(exe), '/win32manifest:' + str(ROOT / 'app.manifest'),
                     '/resource:' + str(work / 'RoadRashMultiFix.dll') + ',RoadRashMultiFix.dll',
                     '/resource:' + str(work / 'ddraw.dll') + ',ddraw.dll',
                     '/resource:' + str(ROOT / 'app.ico') + ',app.ico',
+                    '/resource:' + str(ROOT / 'docs/logo.png') + ',logo.png',
                     '/resource:' + str(ROOT / 'RoadRashHD.ini') + ',RoadRashHD.ini',
                     '/resource:' + str(ROOT / 'LICENSE') + ',LICENSE', '/reference:System.Windows.Forms.dll', '/reference:System.Drawing.dll',
                     str(ROOT / 'PatchWindow.cs'),

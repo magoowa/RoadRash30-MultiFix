@@ -1498,6 +1498,16 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
         auto wineVersion=reinterpret_cast<WineVersion>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"wine_get_version"));
         int surface=GetPrivateProfileIntW(L"Graphics",L"ChildSurface",-1,configPath.c_str());
         gpu.useChildWindow=surface>=0?surface!=0:wineVersion==nullptr;
+        {   // environment line for bug reports
+            typedef LONG(WINAPI* RtlGetVersionFn)(OSVERSIONINFOW*);
+            OSVERSIONINFOW os{};os.dwOSVersionInfoSize=sizeof os;
+            auto rtlGetVersion=reinterpret_cast<RtlGetVersionFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"RtlGetVersion"));
+            if(rtlGetVersion)rtlGetVersion(&os);
+            SYSTEM_INFO si{};GetNativeSystemInfo(&si);
+            char m[200];std::snprintf(m,sizeof m,"environment: Windows %lu.%lu build %lu (reported), %lu logical CPUs, %s",os.dwMajorVersion,os.dwMinorVersion,os.dwBuildNumber,
+                si.dwNumberOfProcessors,wineVersion?"Wine/Proton":"native Windows");
+            status(m);
+        }
         if(wineVersion){std::string m=std::string("running under Wine ")+wineVersion()+(gpu.useChildWindow?" (Direct3D surface: child window)":" (Direct3D surface: game window)");status(m.c_str());}
     }
     applyQuality();

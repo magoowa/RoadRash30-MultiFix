@@ -4,6 +4,7 @@
 #
 #   ./install.sh "/path/to/Road Rash 30th Anniversary Edition"            install / update
 #   ./install.sh "/path/to/Road Rash 30th Anniversary Edition" --remove   remove again
+#   ./install.sh "/path/to/Road Rash 30th Anniversary Edition" --overwrite-ini   also replace RoadRashHD.ini
 #
 # Steam: Properties -> General -> Launch Options:
 #   WINEDLLOVERRIDES="ddraw=n,b" %command%
@@ -39,7 +40,9 @@ if [[ -f "$game/ddraw.dll" ]] && ! cmp -s "$game/ddraw.dll" "$here/ddraw.dll" &&
     echo "Existing ddraw.dll saved as ddraw.dll.multifix-backup"
 fi
 cp -f "$here/ddraw.dll" "$here/RoadRashMultiFix.dll" "$game/"
-[[ -f "$game/RoadRashHD.ini" ]] || { [[ -f "$here/RoadRashHD.ini" ]] && cp "$here/RoadRashHD.ini" "$game/"; }
+if [[ -f "$here/RoadRashHD.ini" ]] && { [[ ! -f "$game/RoadRashHD.ini" ]] || [[ "$action" == "--overwrite-ini" ]]; }; then
+    cp -f "$here/RoadRashHD.ini" "$game/"
+fi
 
 cat <<MSG
 MultiFix installed in: $game

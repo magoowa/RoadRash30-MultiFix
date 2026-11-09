@@ -99,6 +99,23 @@ public:
                 DXGI_ADAPTER_DESC desc{}; ad->GetDesc(&desc);
                 char name[160]; WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof name, nullptr, nullptr);
                 char msg[256]; std::snprintf(msg, sizeof msg, "Direct3D 11 renderer on %s", name); say(msg);
+                std::snprintf(msg, sizeof msg, "adapter: vendor %04x device %04x, %u MB dedicated video memory, feature level 0x%x, shaders %s, swap chain on %s",
+                    desc.VendorId, desc.DeviceId, unsigned(desc.DedicatedVideoMemory >> 20), unsigned(got),
+#ifdef RRHD_PRECOMPILED_SHADERS
+                    "pre-compiled",
+#else
+                    "compiled at run time",
+#endif
+                    useChildWindow ? "a child window" : "the game window"); say(msg);
+                // Which implementations answer (DXVK, wined3d, the vendor driver): the module paths tell.
+                struct { const wchar_t* wide; const char* narrow; } modules[] = { { L"d3d11.dll", "d3d11.dll" }, { L"dxgi.dll", "dxgi.dll" } };
+                for (const auto& m : modules) {
+                    wchar_t path[MAX_PATH]{}; HMODULE h = GetModuleHandleW(m.wide);
+                    if (h && GetModuleFileNameW(h, path, MAX_PATH)) {
+                        char utf8[600]; WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof utf8, nullptr, nullptr);
+                        std::snprintf(msg, sizeof msg, "module %s = %.300s", m.narrow, utf8); say(msg);
+                    }
+                }
             }
             if (ad) ad->Release(); if (dd) dd->Release();
         }

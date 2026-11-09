@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <dxgi1_5.h>        // waitable swap chain (1.3) and tearing support (1.5)
 #include <d3dcompiler.h>
 #include "hd_shaders_hlsl.hpp"
 #if defined(__has_include)
@@ -56,6 +57,12 @@ public:
     // last flip-model frame). false: the swap chain is created on the game window itself (the usual path under Wine/Proton).
     bool useChildWindow = true;
     bool failed = false;
+    // Low-latency presentation (set before init): a waitable swap chain with at most one queued frame, and
+    // tearing presents when VSync is off (no compositor copy wait). Both fall back silently when unsupported.
+    bool lowLatency = true;
+    bool allowTearing = true;
+    bool tearingActive() const { return tearingOk; }
+    bool waitableActive() const { return waitable != nullptr; }
 
     bool ready() const { return device && swap && !failed; }
     HWND windowHandle() const { return window; }
@@ -69,6 +76,7 @@ public:
     void releaseWindow() {
         if (ctx) ctx->ClearState();
         rel(backRTV); rel(swap);
+        closeWaitable();
         if (ctx) ctx->Flush();              // make sure DXGI really destroyed the swap chain first
         if (child) { DestroyWindow(child); child = nullptr; }
         if (window && IsWindow(window)) InvalidateRect(window, nullptr, FALSE);   // let the game repaint what it drew with GDI
@@ -154,15 +162,41 @@ public:
             SetWindowPos(child, HWND_TOP, 0, 0, backW, backH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
             target = child;
         }
+        tearingOk = false; swapFlags = 0;
+        if (allowTearing) {
+            IDXGIFactory5* factory5 = nullptr; BOOL tearing = FALSE;
+            if (SUCCEEDED(factory->QueryInterface(__uuidof(IDXGIFactory5), (void**)&factory5))) {
+                if (SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof tearing)) && tearing) tearingOk = true;
+                factory5->Release();
+            }
+        }
+        if (tearingOk) swapFlags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        if (lowLatency) swapFlags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        sd.Flags = swapFlags;
         HRESULT hr = factory2->CreateSwapChainForHwnd(device, target, &sd, nullptr, nullptr, &swap);
+        if (FAILED(hr) && swapFlags) {      // an older driver may refuse the flags: plain flip-model chain
+            tearingOk = false; swapFlags = 0; sd.Flags = 0;
+            hr = factory2->CreateSwapChainForHwnd(device, target, &sd, nullptr, nullptr, &swap);
+        }
         if (SUCCEEDED(hr)) factory->MakeWindowAssociation(target, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
         factory2->Release(); factory->Release();
         if (FAILED(hr)) return fail("CreateSwapChainForHwnd failed", hr);
+        if (swapFlags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
+            IDXGISwapChain2* swap2 = nullptr;
+            if (SUCCEEDED(swap->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&swap2))) {
+                swap2->SetMaximumFrameLatency(1);
+                waitable = swap2->GetFrameLatencyWaitableObject();
+                swap2->Release();
+            }
+        }
+        if (log) { char m[160]; std::snprintf(m, sizeof m, "present: %s, tearing %s", waitable ? "waitable swap chain (1 frame latency)" : "standard swap chain", tearingOk ? "allowed" : "off"); log(m); }
         return createBackBufferView();
     }
+    void closeWaitable() { if (waitable) { CloseHandle(waitable); waitable = nullptr; } }
     void shutdown() {
         if (ctx) ctx->ClearState();
         rel(backRTV); rel(swap);
+        closeWaitable();
         if (child) { DestroyWindow(child); child = nullptr; }
         rel(sceneRT); rel(sceneRTV); rel(sceneSRV); rel(cpuTex); rel(cpuSRV); rel(backRTV);
         rel(swap); rel(ctx); rel(device);
@@ -171,6 +205,8 @@ public:
         rel(quadBuf); rel(quadSRV); rel(frameCB);
         rel(vsFull); rel(psBackdrop); rel(vsQuad); rel(psQuad); rel(psCopyCpu); rel(psUi); rel(psPresent);
         rel(blendOpaque); rel(blendUi); rel(blendQuad); rel(rast); rel(pointSampler); rel(linearSampler); rel(readStage);
+        for (int i = 0; i < TS_SETS; ++i) { rel(tsDisjoint[i]); rel(tsStart[i]); rel(tsEnd[i]); tsInFlight[i] = false; }
+        tsReady = false; tsOpen = false; tsWrite = 0;
         window = nullptr;
     }
 
@@ -196,7 +232,49 @@ public:
     }
     // The static atlas caches level textures by pointer; call when a level (re)loads.
     void flushTextures() { staticMap.clear(); staticShelves.clear(); staticTop = 0; }
-    void beginFrame() { frameShelves.clear(); frameTop = 0; }
+    void beginFrame() {
+        frameShelves.clear(); frameTop = 0;
+        // Wait until the swap chain can take a frame: at most one frame is ever queued, so input is never
+        // older than one frame. The short timeout keeps the game running if a frame was abandoned.
+        if (waitable) WaitForSingleObjectEx(waitable, 40, TRUE);
+        timingBegin();
+    }
+
+    // GPU time per frame (Profile=1): timestamp queries around the scene, the UI and the scaling pass. Results arrive a few
+    // frames late; takeGpuTimes() hands out what has been collected since the last call (milliseconds).
+    bool timing = false;
+    std::vector<float> takeGpuTimes() { std::vector<float> out; out.swap(gpuTimes); return out; }
+    void timingBegin() {
+        if (!timing || !device) return;
+        if (!tsReady) {
+            D3D11_QUERY_DESC qd{}; bool ok = true;
+            for (int i = 0; i < TS_SETS && ok; ++i) {
+                qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT; ok = SUCCEEDED(device->CreateQuery(&qd, &tsDisjoint[i]));
+                qd.Query = D3D11_QUERY_TIMESTAMP; ok = ok && SUCCEEDED(device->CreateQuery(&qd, &tsStart[i])) && SUCCEEDED(device->CreateQuery(&qd, &tsEnd[i]));
+            }
+            if (!ok) { timing = false; return; }
+            tsReady = true;
+        }
+        collectTimes();
+        ctx->Begin(tsDisjoint[tsWrite]); ctx->End(tsStart[tsWrite]); tsOpen = true;
+    }
+    void timingEnd() {
+        if (!timing || !tsReady || !tsOpen) return;
+        ctx->End(tsEnd[tsWrite]); ctx->End(tsDisjoint[tsWrite]); tsInFlight[tsWrite] = true; tsOpen = false;
+        tsWrite = (tsWrite + 1) % TS_SETS;
+    }
+    void collectTimes() {
+        for (int n = 0; n < TS_SETS; ++n) {
+            int i = (tsWrite + n) % TS_SETS;       // oldest first
+            if (!tsInFlight[i]) continue;
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{}; UINT64 a = 0, b = 0;
+            if (ctx->GetData(tsDisjoint[i], &dj, sizeof dj, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) break;
+            if (ctx->GetData(tsStart[i], &a, sizeof a, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) break;
+            if (ctx->GetData(tsEnd[i], &b, sizeof b, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) break;
+            tsInFlight[i] = false;
+            if (!dj.Disjoint && dj.Frequency && b >= a && gpuTimes.size() < 4096) gpuTimes.push_back(float(double(b - a) * 1000.0 / double(dj.Frequency)));
+        }
+    }
 
     // Uploads a W x H indexed texture (or finds it in the cache) and returns its atlas origin.
     bool texture(const uint8_t* pixels, int w, int h, bool transient, uint32_t& xy, uint32_t& flagsOut) {
@@ -312,7 +390,7 @@ public:
         if (cw != backW || ch != backH) {
             if (backRTV) { ctx->OMSetRenderTargets(0, nullptr, nullptr); rel(backRTV); }
             if (child) SetWindowPos(child, HWND_TOP, 0, 0, cw, ch, SWP_NOACTIVATE);
-            HRESULT hr = swap->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
+            HRESULT hr = swap->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, swapFlags);
             if (FAILED(hr)) return fail("ResizeBuffers failed", hr);
             backW = cw; backH = ch;
             if (!createBackBufferView()) return false;
@@ -336,7 +414,8 @@ public:
         ctx->OMSetBlendState(blendOpaque, nullptr, 0xffffffff);
         ctx->Draw(3, 0);
         ID3D11ShaderResourceView* none = nullptr; ctx->PSSetShaderResources(7, 1, &none);
-        HRESULT hr = swap->Present(syncInterval, 0);
+        timingEnd();
+        HRESULT hr = swap->Present(syncInterval, (syncInterval == 0 && tearingOk) ? DXGI_PRESENT_ALLOW_TEARING : 0);
         if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) return fail("device lost", hr);
         return true;
     }
@@ -378,6 +457,9 @@ private:
     }
     ID3D11Device* device = nullptr; ID3D11DeviceContext* ctx = nullptr; IDXGISwapChain1* swap = nullptr;
     ID3D11RenderTargetView* backRTV = nullptr;
+    HANDLE waitable = nullptr;
+    bool tearingOk = false;
+    UINT swapFlags = 0;
     ID3D11Texture2D *sceneRT = nullptr, *cpuTex = nullptr, *paletteTex = nullptr, *legacyTex = nullptr, *horizonTex = nullptr,
         *staticAtlas = nullptr, *frameAtlas = nullptr, *uiTex = nullptr, *readStage = nullptr;
     ID3D11RenderTargetView* sceneRTV = nullptr;
@@ -387,6 +469,11 @@ private:
     ID3D11VertexShader *vsFull = nullptr, *vsQuad = nullptr;
     ID3D11PixelShader *psBackdrop = nullptr, *psQuad = nullptr, *psCopyCpu = nullptr, *psUi = nullptr, *psPresent = nullptr;
     ID3D11BlendState *blendOpaque = nullptr, *blendUi = nullptr, *blendQuad = nullptr;
+    static const int TS_SETS = 6;
+    ID3D11Query *tsDisjoint[TS_SETS] = {}, *tsStart[TS_SETS] = {}, *tsEnd[TS_SETS] = {};
+    bool tsReady = false, tsOpen = false, tsInFlight[TS_SETS] = {};
+    int tsWrite = 0;
+    std::vector<float> gpuTimes;
     ID3D11RasterizerState* rast = nullptr;
     ID3D11SamplerState *pointSampler = nullptr, *linearSampler = nullptr;
     pD3DCompile compileFn = nullptr;

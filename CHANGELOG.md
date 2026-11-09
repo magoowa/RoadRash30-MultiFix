@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.16.0
+
+- **High Performance mode** (`[Performance] HighPerformance`, launcher option, on by default): Windows power throttling (EcoQoS) off for the game, 1 ms timer, priority slightly above normal. Meant for laptops and integrated GPUs; no measurable difference on a machine that already held 60 fps.
+- **Dialog look:** the game's own Open/Save dialogs and message boxes, and dialogs of other DLLs shown from the game thread (the netplay chooser), use the themed Windows look: the DLL carries a visual-styles (Common-Controls 6) manifest that is switched on for the game thread. The dialogs themselves are unchanged.
+- **Windowed mode from the game menu:** choosing "Windowed" in the game menu no longer shrinks the window to 4:3; it gets the size from `[Window] Width/Height` (or the automatic 16:9 size) like at start-up.
+- **Intel iGPU Battery Boost** (`[Performance] LowLatency=0`, launcher option, on by default): performance boost on battery-powered Intel iGPU. With `LowLatency=1` (waitable swap chain with one queued frame plus a tearing present) an Intel Iris Xe laptop on battery dropped from 60 to 45 fps (frame interval 16.7 to 22.2 ms, present about 17 ms instead of 0.9 ms); with it off the game ran at a steady 60 fps. The launcher check box is the inverse of the ini key.
+- **Quality presets** (`[Graphics] Quality`, ini only): High / Medium (720p) / Low (540p) / Minimum (480p) / Auto. Auto lowers the render height for the next start after two slow windows of about 600 frames; a fixed `RenderHeight` wins.
+- **GPU time in the profile log:** with `Profile=1` the log line shows the GPU milliseconds per frame (avg, p95, max), measured with timestamp queries.
+- **Smooth text and interface** (`[Graphics] SmoothText`, ini only, off by default): bilinear filtering of the text and the interface. The menus are scaled to the window with bilinear sampling instead of nearest (the smoothed frame is cached and rebuilt only when the menu picture changes), and the race HUD and text layer is drawn with the smoothing shader of the Direct3D renderer. Off, the text stays crisp as before.
+- **Launcher layout:** the logo moved to the top left, the installations list, executable, MultiFix, language and netplay lines are next to it, the game folder box is gone (the list shows it), and the authors and contributions are listed above the buttons. One font and one margin everywhere, so all blocks line up.
+- **Netplay detection:** the launcher checks for `wsock32.dll` in the game folder (OKPlay) and shows its datecode; when it is missing it shows a **download netplay** link. That downloads the newest OKPlay package from https://oldkid.net/aoe2net/latest.php and unpacks `netcheck.exe`, `okplay.ini` (an existing one is kept), `wsock32.dll` and `readme.txt` (saved as `oldkid_netplay_readme.txt`) into the game folder. If oldkid.net fails, the OKPlay GitHub release is tried; if that fails too, the launcher shows the error and a link to https://github.com/Patrick-Working/okplay/.
+- **Update check:** the launcher asks GitHub for the latest MultiFix release in the background and, if it is newer than the installed version, shows a clickable message with the version number. Clicking the logo opens the project page.
+
 ## 2.15.0
 
 - **FMV Volume** (`[Game] VideoVolume`, launcher slider): sets the volume of all videos (.avi and .mp4) from 0 to 100 % of the game's volume. The game's audio session volume is scaled while a video plays and restored afterwards.

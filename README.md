@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/logo.png" width="420" alt="Road Rash 30 MultiFix"></p>
 
-<p align="center"><b>v2.15.0</b> &nbsp;|&nbsp; <a href="https://github.com/magoowa/RoadRash30-MultiFix/releases/latest"><b>Download the latest release</b></a> &nbsp;|&nbsp; <a href="CHANGELOG.md">Changelog</a></p>
+<p align="center"><b>v2.16.0</b> &nbsp;|&nbsp; <a href="https://github.com/magoowa/RoadRash30-MultiFix/releases/latest"><b>Download the latest release</b></a> &nbsp;|&nbsp; <a href="CHANGELOG.md">Changelog</a></p>
 
 Fixes, widescreen and a Direct3D 11 renderer for **Road Rash: 30th Anniversary Edition** (GOG, EA app and Steam). Authors: **OBLPlife** (original author) and **magoowa**.
 
@@ -44,6 +44,8 @@ Added in this fork:
 - **No EXE modification:** loads through a `ddraw.dll` proxy; GOG Galaxy "Verify / Repair" does not undo it.
 - **Installer and launcher:** detects GOG, EA app and Steam installations, shows the executable version, has one row per option (read from and saved to `RoadRashHD.ini` live), a **Play** button, detection of the MultiFix installation and its DLL version in the game folder (if it is missing or outdated, Play asks whether to install/update first; Yes or No, the game starts either way), backup/restore, HiDPI-safe layout and a custom icon.
 - **Stutter Fix:** the controller scan that froze the game for ~165 ms every two seconds now runs in the background.
+- **Windowed mode from the game menu** keeps the configured window size (`[Window] Width/Height` or automatic 16:9) instead of switching to 4:3.
+- **Netplay download:** the launcher shows whether `wsock32.dll` (OKPlay) is in the game folder. If not, the **download netplay** link fetches the newest package from oldkid.net (OKPlay GitHub release as fallback) and unpacks `netcheck.exe`, `okplay.ini` (an existing one is kept), `wsock32.dll` and `oldkid_netplay_readme.txt` into the game folder.
 - **FMV Volume:** a slider in the launcher sets the volume of all intro and story videos (.avi and .mp4), 0-100 %.
 - **Fix Bike Colors:** the Rat and Super bikes have each other's colours in the race (the shop pictures are right); the two groups of five colour tables are swapped back (the same change as Anakin94's fix for the 1996 exe). Thanks to Anakin94 and peemosa for finding the bug.
 - **Fix Text Encoding:** Unicode text the game misreads (the trademark sign shown as `â„¢`, curly quotes, accents) is displayed correctly even with Windows' UTF-8 system code page.
@@ -56,7 +58,7 @@ Added in this fork:
 - **Controller skips videos and operates the Race Resolution dialog:** A, B, X, Y, Start or Back skip a video; in Race Resolution the D-pad picks the resolution, A applies and B cancels.
 - **Sprite Position Interpolation:** far riders, cars and pedestrians are updated every frame instead of every 2-8 frames (`FullRateObjects`).
 - **Direct3D 11 hardware renderer** (`D3D11=1`, default): the scene, textures, palette and presentation run on the GPU, with the CPU/GDI path as an automatic fallback. This makes **bilinear texture filtering** (`TextureFilter`, default on) practically free even at 4K.
-- **Menus and text are never filtered**; texture filtering (`TextureFilter`) applies only to the 3D game environment and only in the Direct3D renderer. **Skip intro** (`SkipIntro`, off by default) keeps the menu music.
+- **Menus and text are crisp by default**; texture filtering (`TextureFilter`) applies only to the 3D game environment and only in the Direct3D renderer. Bilinear filtering of the text and the interface is available as an option (`SmoothText`, see Configuration). **Skip intro** (`SkipIntro`, off by default) keeps the menu music.
 
 ### v1.1.1 Animation Crash Fix
 
@@ -69,7 +71,11 @@ All options are in `RoadRashHD.ini` (game folder) and in the installer/launcher 
 | Section | Option | Default | What it does |
 | --- | --- | :---: | --- |
 | `[Graphics]` | `D3D11` | 1 | Direct3D 11 hardware renderer. Falls back to the CPU renderer automatically if it cannot start; `0` forces the CPU renderer. |
-| `[Graphics]` | `TextureFilter` | 1 | Smooth (bilinear) textures of the 3D game environment in races (road, buildings, sky). Direct3D renderer only; menus and text are never filtered. |
+| `[Graphics]` | `TextureFilter` | 1 | Smooth (bilinear) textures of the 3D game environment in races (road, buildings, sky). Direct3D renderer only; menus and text are not touched by this option (see `SmoothText`). |
+| `[Graphics]` | `SmoothText` | 0 | Bilinear filtering of the text and the interface instead of crisp pixels: the menus (the 640x480 menu picture is sampled bilinearly into the window) and the race HUD and text layer (Direct3D renderer). Ini only, not shown in the launcher. |
+| `[Graphics]` | `Quality` | High | Resolution preset for weaker graphics: High = window size, Medium = 720p, Low = 540p, Minimum = 480p, Auto = starts at window size and, when races run slower than 12.5 ms per frame twice in a row (about 10 s each), lowers the height for the next start (`AutoRenderHeight`). A fixed `RenderHeight` overrides it. Ini only. |
+| `[Performance]` | `HighPerformance` | 1 | Turns off Windows power throttling (EcoQoS) for the game, requests a 1 ms timer and raises the priority slightly (above normal). Helps laptops and integrated GPUs. |
+| `[Performance]` | `LowLatency` | 0 | Keep it at 0: performance boost on battery-powered Intel iGPU. With 1 (waitable swap chain with one queued frame and a tearing present) an Intel Iris Xe laptop on battery dropped from 60 to 45 fps. Launcher: **Intel iGPU Battery Boost** (on = 0). |
 | `[Graphics]` | `VSync` | 0 | Waits for the monitor refresh before showing each frame: no tearing, slightly more latency. |
 | `[Window]` | `WideWindow` | 1 | Plays the whole game in widescreen (a wide field of view, and a 16:9 window when not fullscreen) instead of the original 4:3. |
 | `[Window]` | `AltEnterFullscreen` | 1 | Alt+Enter and F11 switch between window and borderless fullscreen. |
@@ -94,7 +100,6 @@ Advanced options, not shown in the launcher (add them to the ini):
 ## Build from Source
 
 Requires Windows, Python 3.10+, Visual Studio C++ Desktop Development tools, Windows SDK and a .NET Framework 4.x compiler.
-
 ```powershell
 python build.py
 ```

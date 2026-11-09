@@ -28,8 +28,10 @@ internal sealed class PatchOption
 {
     public string Section, Key, Label, Hint;
     public bool Default;
-    public PatchOption(string section, string key, bool def, string label, string hint)
-    { Section = section; Key = key; Default = def; Label = label; Hint = hint; }
+    // Inverted: the check box means the opposite of the ini value (checked = ini value 0).
+    public bool Inverted;
+    public PatchOption(string section, string key, bool def, string label, string hint, bool inverted = false)
+    { Section = section; Key = key; Default = def; Label = label; Hint = hint; Inverted = inverted; }
 }
 
 internal static class Installer
@@ -46,7 +48,7 @@ internal static class Installer
     static readonly Dictionary<string, string> KnownExecutables = new Dictionary<string, string>
     {
         { "9e40e25737149ab095061b7154797a35495faea97644fafc5a1e616f1400c968",
-          "English build, identical in GOG (60184028392664413) and Steam (26105967)" }
+          "GOG (60184028392664413) and Steam (26105967)" }
     };
 
     // Every switch of RoadRashHD.ini that makes sense to a player; each is shown on its own row, one line each.
@@ -58,6 +60,8 @@ internal static class Installer
         new PatchOption("Graphics", "D3D11", true, "Direct3D 11 Hardware Renderer", "Draws and presents the 3D scene on the GPU; falls back to the CPU renderer if unavailable"),
         new PatchOption("Graphics", "TextureFilter", true, "Texture Filtering (Direct3D Only)", "Bilinear filtering of the game's 3D environment (road, buildings, sky); never menus or text"),
         new PatchOption("Graphics", "VSync", false, "VSync", "Waits for the monitor refresh when presenting (off = lowest latency)"),
+        new PatchOption("Performance", "HighPerformance", true, "High Performance Mode", "Turns off Windows power throttling for the game, 1 ms timer, slightly higher priority (helps integrated GPUs and laptops)"),
+        new PatchOption("Performance", "LowLatency", true, "Intel iGPU Battery Boost", "Turns off Low-Latency Presentation: faster on battery-powered Intel iGPUs", true),
         new PatchOption("Window", "WideWindow", true, "Widescreen (16:9) Game", "Plays the whole game in widescreen (wide field of view) instead of the original 4:3"),
         new PatchOption("Window", "AltEnterFullscreen", true, "Alt+Enter / F11 Fullscreen Toggle", "Switches between the window and borderless fullscreen"),
         new PatchOption("Input", "SymmetricSteering", true, "Symmetric Analog Steering", "Controller stick turns right as gently as left (the game made right about twice as sensitive)"),
@@ -307,6 +311,175 @@ internal static class Installer
         }
         catch (Exception) { return false; }
     }
+    // ------------------------------------------------------------------ links, netplay, updates
+
+    public const string ProjectUrl = "https://github.com/magoowa/RoadRash30-MultiFix";
+    public const string OkPlayUrl = "https://github.com/Patrick-Working/okplay/";
+    const string LatestReleaseApi = "https://api.github.com/repos/magoowa/RoadRash30-MultiFix/releases/latest";
+    public const string LatestReleaseUrl = ProjectUrl + "/releases/latest";
+
+    // Netplay (OKPlay) works through a wsock32.dll in the game folder. Returns its datecode (yyyyMMMdd of the file),
+    // or null when the DLL is missing.
+    public static string NetplayDatecode(string folder)
+    {
+        try
+        {
+            string dll = Path.Combine(folder ?? "", "wsock32.dll");
+            if (!File.Exists(dll)) return null;
+            return File.GetLastWriteTime(dll).ToString("yyyyMMMdd", System.Globalization.CultureInfo.InvariantCulture);
+        }
+        catch (Exception) { return null; }
+    }
+
+    // "2.15.0", "v2.15.0" -> numbers; anything else -> null.
+    static int[] ParseVersion(string text)
+    {
+        if (text == null) return null;
+        var match = Regex.Match(text.Trim(), @"^[vV]?(\d+)\.(\d+)(?:\.(\d+))?");
+        if (!match.Success) return null;
+        return new[] { int.Parse(match.Groups[1].Value), int.Parse(match.Groups[2].Value), match.Groups[3].Success ? int.Parse(match.Groups[3].Value) : 0 };
+    }
+    // True when latest is a higher version than current.
+    public static bool IsNewer(string latest, string current)
+    {
+        int[] a = ParseVersion(latest), b = ParseVersion(current);
+        if (a == null || b == null) return false;
+        for (int i = 0; i < 3; ++i) if (a[i] != b[i]) return a[i] > b[i];
+        return false;
+    }
+    // Reads tag_name and html_url from the GitHub "latest release" JSON.
+    public static bool ParseLatestRelease(string json, out string version, out string url)
+    {
+        version = null; url = LatestReleaseUrl;
+        if (string.IsNullOrEmpty(json)) return false;
+        var tag = Regex.Match(json, "\"tag_name\"\\s*:\\s*\"([^\"]+)\"");
+        if (!tag.Success || ParseVersion(tag.Groups[1].Value) == null) return false;
+        version = tag.Groups[1].Value.TrimStart('v', 'V');
+        var page = Regex.Match(json, "\"html_url\"\\s*:\\s*\"(https://github\\.com/magoowa/RoadRash30-MultiFix/[^\"]*)\"");
+        if (page.Success) url = page.Groups[1].Value;
+        return true;
+    }
+    // Asks GitHub for the latest release (blocking; call it from a worker thread). Null on any failure.
+    public static string FetchLatestReleaseJson()
+    {
+        try
+        {
+            System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)3072;   // TLS 1.2
+            var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(LatestReleaseApi);
+            request.UserAgent = "RoadRash30-MultiFix-launcher";
+            request.Accept = "application/vnd.github+json";
+            request.Timeout = 8000;
+            using (var response = request.GetResponse())
+            using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8)) return reader.ReadToEnd();
+        }
+        catch (Exception) { return null; }
+    }
+
+    // ------------------------------------------------------------------ netplay download (OKPlay by Oldkid.net)
+
+    // Primary source (a redirect to the newest zip); the GitHub release of okplay is the fallback. Tests replace the list.
+    internal static string[] NetplayUrls = { "https://oldkid.net/aoe2net/latest.php" };
+    const string OkPlayReleaseApi = "https://api.github.com/repos/Patrick-Working/okplay/releases/latest";
+    // What is taken from the zip (by file name, wherever it sits in the archive). readme.txt is saved as oldkid_netplay_readme.txt.
+    static readonly string[] NetplayFiles = { "netcheck.exe", "okplay.ini", "wsock32.dll", "readme.txt" };
+    const int NetplayMaxBytes = 25 * 1024 * 1024;
+
+    static byte[] DownloadBytes(string url)
+    {
+        System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)3072;   // TLS 1.2
+        var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+        request.UserAgent = "RoadRash30-MultiFix-launcher";
+        request.Timeout = 20000; request.ReadWriteTimeout = 20000; request.AllowAutoRedirect = true;
+        using (var response = request.GetResponse())
+        using (var stream = response.GetResponseStream())
+        using (var memory = new MemoryStream())
+        {
+            var buffer = new byte[65536]; int read;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                memory.Write(buffer, 0, read);
+                if (memory.Length > NetplayMaxBytes) throw new InvalidDataException("The download is larger than expected.");
+            }
+            return memory.ToArray();
+        }
+    }
+
+    // Unpacks netcheck.exe, okplay.ini, wsock32.dll and readme.txt (as oldkid_netplay_readme.txt) into the game folder.
+    // An okplay.ini that is already there is kept (it holds the player's settings). Returns the names written.
+    public static List<string> ExtractNetplay(byte[] zipBytes, string folder)
+    {
+        var written = new List<string>();
+        using (var archive = new System.IO.Compression.ZipArchive(new MemoryStream(zipBytes), System.IO.Compression.ZipArchiveMode.Read))
+        {
+            var found = new Dictionary<string, System.IO.Compression.ZipArchiveEntry>();
+            foreach (var entry in archive.Entries)
+            {
+                string name = Path.GetFileName(entry.FullName.Replace('/', '\\')).ToLowerInvariant();   // folders in the zip are ignored
+                if (Array.IndexOf(NetplayFiles, name) >= 0 && entry.Length > 0 && entry.Length <= NetplayMaxBytes && !found.ContainsKey(name)) found[name] = entry;
+            }
+            if (!found.ContainsKey("wsock32.dll")) throw new InvalidDataException("The archive does not contain wsock32.dll.");
+            foreach (string name in NetplayFiles)
+            {
+                System.IO.Compression.ZipArchiveEntry entry;
+                if (!found.TryGetValue(name, out entry)) continue;
+                string target = name == "readme.txt" ? "oldkid_netplay_readme.txt" : name;
+                string destination = Path.Combine(folder, target);
+                if (name == "okplay.ini" && File.Exists(destination)) continue;   // keep the player's settings
+                byte[] data;
+                using (var input = entry.Open()) using (var memory = new MemoryStream()) { input.CopyTo(memory); data = memory.ToArray(); }
+                if (name.EndsWith(".dll") || name.EndsWith(".exe"))
+                    if (data.Length < 2 || data[0] != 0x4d || data[1] != 0x5a) throw new InvalidDataException(name + " is not a Windows program.");
+                string temp = destination + ".download";
+                File.WriteAllBytes(temp, data);
+                if (File.Exists(destination)) File.Delete(destination);
+                File.Move(temp, destination);
+                written.Add(target);
+            }
+        }
+        return written;
+    }
+
+    // First zip asset of the latest okplay release on GitHub, or null (there may be none).
+    static string OkPlayReleaseZipUrl()
+    {
+        if (Environment.GetEnvironmentVariable("RRMF_NO_UPDATE_CHECK") == "1") return null;   // tests never reach the network
+        try
+        {
+            System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)3072;
+            var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(OkPlayReleaseApi);
+            request.UserAgent = "RoadRash30-MultiFix-launcher"; request.Accept = "application/vnd.github+json"; request.Timeout = 10000;
+            using (var response = request.GetResponse()) using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+            {
+                var match = Regex.Match(reader.ReadToEnd(), "\"browser_download_url\"\\s*:\\s*\"(https://[^\"]+\\.zip)\"");
+                return match.Success ? match.Groups[1].Value : null;
+            }
+        }
+        catch (Exception) { return null; }
+    }
+
+    // Downloads netplay (blocking; call from a worker thread). Returns where it came from, or null with the reason in error.
+    public static string DownloadNetplay(string folder, out string error)
+    {
+        error = null;
+        if (string.IsNullOrEmpty(folder) || !File.Exists(Path.Combine(folder, ExeName))) { error = "Choose the game folder first."; return null; }
+        foreach (var process in Process.GetProcessesByName("RoadRash95")) { process.Dispose(); error = "Close Road Rash first."; return null; }
+        var attempts = new List<string>(NetplayUrls);
+        var reasons = new StringBuilder();
+        for (int i = 0; i <= attempts.Count; ++i)
+        {
+            string url = i < attempts.Count ? attempts[i] : OkPlayReleaseZipUrl();   // GitHub release comes last
+            if (url == null) { reasons.Append("GitHub: no release to download. "); break; }
+            try
+            {
+                ExtractNetplay(DownloadBytes(url), folder);
+                return new Uri(url).Host;
+            }
+            catch (Exception failure) { reasons.Append(new Uri(url).Host).Append(": ").Append(failure.Message).Append(' '); }
+        }
+        error = reasons.ToString().Trim();
+        return null;
+    }
+
     // Writes one option to RoadRashHD.ini immediately. Returns false when the ini does not exist yet.
     public static bool SaveOption(string folder, PatchOption option, bool value)
     {
@@ -314,7 +487,7 @@ internal static class Installer
         {
             string ini = Path.Combine(folder ?? "", IniName);
             if (!File.Exists(ini)) return false;
-            return WritePrivateProfileString(option.Section, option.Key, value ? "1" : "0", ini);
+            return WritePrivateProfileString(option.Section, option.Key, (value != option.Inverted) ? "1" : "0", ini);
         }
         catch (Exception) { return false; }
     }
@@ -335,7 +508,7 @@ internal static class Installer
     {
         string ini = Path.Combine(folder ?? "", IniName);
         if (!File.Exists(ini)) return option.Default;
-        return GetPrivateProfileInt(option.Section, option.Key, option.Default ? 1 : 0, ini) != 0;
+        return (GetPrivateProfileInt(option.Section, option.Key, (option.Default != option.Inverted) ? 1 : 0, ini) != 0) != option.Inverted;
     }
 
     // ------------------------------------------------------------------ file operations
@@ -540,13 +713,13 @@ internal static class Installer
         {
             bool value;
             if (options.TryGetValue(o.Section + "/" + o.Key, out value))
-                WritePrivateProfileString(o.Section, o.Key, value ? "1" : "0", ini);
+                WritePrivateProfileString(o.Section, o.Key, (value != o.Inverted) ? "1" : "0", ini);
             else
             {
                 // No explicit choice (quiet install): add keys missing from an older ini with their defaults.
                 var current = new StringBuilder(8);
                 GetPrivateProfileString(o.Section, o.Key, "?", current, 8, ini);
-                if (current.ToString() == "?") WritePrivateProfileString(o.Section, o.Key, o.Default ? "1" : "0", ini);
+                if (current.ToString() == "?") WritePrivateProfileString(o.Section, o.Key, (o.Default != o.Inverted) ? "1" : "0", ini);
             }
         }
     }

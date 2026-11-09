@@ -15,3 +15,5 @@ BEGIN
     DEFPUSHBUTTON "Apply", IDOK, 132, 103, 58, 16
     PUSHBUTTON "Cancel", IDCANCEL, 198, 103, 58, 16
 END
+
+201 24 "comctl6.manifest"

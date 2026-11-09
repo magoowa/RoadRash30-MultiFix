@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <commdlg.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <audiopolicy.h>
@@ -61,6 +62,12 @@ std::vector<uint16_t> menuBright, menuDim;
 std::vector<uint32_t> menuBackdrop;
 bool menuBackdropDirty=true;
 bool menuBackdropDim=false;
+// [Graphics] SmoothText=1: text and interface are scaled with bilinear filtering instead of nearest. Menus: the 640x480 menu
+// picture is sampled bilinearly into the window (cached while the picture does not change); the race HUD and text layer is
+// drawn with the smoothing shader of the Direct3D renderer.
+bool smoothUi=false;
+std::vector<int> smoothX0,smoothX1,smoothY0,smoothY1;std::vector<unsigned> smoothWX,smoothWY;   // per output column / row
+bool menuCacheValid=false;uint64_t menuCacheHash=0;
 uint32_t color16[65536]{};
 int colorMasks[3]{};
 std::wstring configPath, logPath;
@@ -234,7 +241,9 @@ HCURSOR WINAPI setCursorHook(HCURSOR cursor) {
 // frame: the start-up logos and loading screens run before that.
 using CreateWindowFn=HWND(WINAPI*)(DWORD,LPCSTR,LPCSTR,DWORD,int,int,int,int,HWND,HMENU,HINSTANCE,LPVOID);
 CreateWindowFn originalCreateWindow=nullptr;
+void themeThread();
 HWND WINAPI createWindowHook(DWORD exStyle,LPCSTR className,LPCSTR title,DWORD style,int x,int y,int w,int h,HWND parent,HMENU menu,HINSTANCE instance,LPVOID param) {
+    themeThread();
     HWND window=originalCreateWindow(exStyle,className,title,style,x,y,w,h,parent,menu,instance,param);
     if(window && autoHideCursor && !IS_INTRESOURCE(className) && std::strcmp(className,"RashRoot")==0) {
         SetClassLongPtrA(window,GCLP_HCURSOR,0);   // no class cursor to bring the arrow back
@@ -242,6 +251,52 @@ HWND WINAPI createWindowHook(DWORD exStyle,LPCSTR className,LPCSTR title,DWORD s
     }
     return window;
 }
+// The game's own "windowed" setting (menu: Windowed / Full screen) resizes its existing window to a multiple of
+// 640x480 (4:3). After it has done that, the window gets the configured size again ([Window] Width/Height, or the
+// automatic 16:9 size); a switch to full screen is just remembered, so Alt+Enter keeps working.
+using SetWindowPosFn=BOOL(WINAPI*)(HWND,HWND,int,int,int,int,UINT);
+SetWindowPosFn originalSetWindowPos=nullptr;
+BOOL WINAPI setWindowPosHook(HWND window,HWND after,int x,int y,int cx,int cy,UINT flags) {
+    BOOL result=originalSetWindowPos(window,after,x,y,cx,cy,flags);
+    if(result && window && window==hookedWindow && !(flags&SWP_NOSIZE)) {
+        if(GetWindowLongA(window,GWL_STYLE)&WS_CAPTION) {
+            borderlessFullscreen=false;desiredFullscreen=false;
+            if(windowWidth>=0 && windowHeight>=0)setWindowedSize(window);
+            InvalidateRect(window,nullptr,FALSE);logWindow(window);
+        } else {borderlessFullscreen=true;desiredFullscreen=true;}
+    }
+    return result;
+}
+// The game has no visual-styles manifest (the exe is never modified), so its Open/Save dialogs and message boxes
+// looked like Windows 95 (tiny toolbar icons). The DLL carries a Common-Controls 6 manifest and switches it on
+// while such a dialog is open; the dialogs themselves stay the game's own.
+HANDLE styleContext=INVALID_HANDLE_VALUE;
+struct StyleScope {
+    ULONG_PTR cookie=0;bool on=false;
+    StyleScope() {
+        if(styleContext==INVALID_HANDLE_VALUE) {
+            ACTCTXW ctx{sizeof ctx};ctx.dwFlags=ACTCTX_FLAG_HMODULE_VALID|ACTCTX_FLAG_RESOURCE_NAME_VALID;
+            ctx.lpResourceName=MAKEINTRESOURCEW(201);
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCWSTR>(&styleContext),&ctx.hModule);
+            styleContext=CreateActCtxW(&ctx);
+        }
+        if(styleContext!=INVALID_HANDLE_VALUE)on=ActivateActCtx(styleContext,&cookie)!=FALSE;
+    }
+    ~StyleScope(){if(on)DeactivateActCtx(0,cookie);}
+};
+// Kept switched on for the whole life of the game's thread, so dialogs of other DLLs shown from it (the netplay
+// chooser of wsock32.dll) are themed too. Called from the places that run on the game thread.
+void themeThread() {
+    static thread_local bool done=false;
+    if(done)return;
+    done=true;
+    static thread_local StyleScope forever;   // never deactivated (activation is per thread)
+    (void)forever;
+}
+using OpenFileFn=BOOL(WINAPI*)(LPOPENFILENAMEA);
+OpenFileFn originalOpenFile=nullptr,originalSaveFile=nullptr;
+BOOL WINAPI getOpenFileNameHook(LPOPENFILENAMEA ofn){StyleScope scope;return originalOpenFile(ofn);}
+BOOL WINAPI getSaveFileNameHook(LPOPENFILENAMEA ofn){StyleScope scope;return originalSaveFile(ofn);}
 LRESULT CALLBACK renderWindowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
     if(autoHideCursor && cursorHidden && !IsWindowEnabled(window))showCursorAgain(window);
     if(autoHideCursor) {
@@ -284,6 +339,7 @@ LRESULT CALLBACK renderWindowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) 
 }
 void logWindow(HWND window);
 void hookWindow(HWND window) {
+    themeThread();
     if(!window || hookedWindow==window)return;
     auto previous=reinterpret_cast<WNDPROC>(SetWindowLongPtrA(window,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(&renderWindowProc)));
     if(previous){hookedWindow=window;previousWindowProc=previous;}
@@ -529,16 +585,24 @@ struct Profiler {
             auto sorted=intervals;std::sort(sorted.begin(),sorted.end());
             size_t n=sorted.size();unsigned slow=0,veryslow=0;
             for(float v:sorted){if(v>20.0f)++slow;if(v>33.0f)++veryslow;}
-            char message[360];
+            char gpuTimeText[120]="gpu time n/a";
+            {   // GPU milliseconds per frame (scene + UI + scaling), measured with timestamp queries
+                auto times=gpu.takeGpuTimes();
+                if(!times.empty()){
+                    std::sort(times.begin(),times.end());double sum=0;for(float v:times)sum+=v;
+                    std::snprintf(gpuTimeText,sizeof gpuTimeText,"gpu ms/frame avg %.2f p95 %.2f max %.2f (%zu samples)",sum/times.size(),times[std::min(times.size()-1,times.size()*95/100)],times.back(),times.size());
+                }
+            }
+            char message[420];
             std::snprintf(message,sizeof message,
                 "profile %dx%d: frames %zu; interval ms p50 %.1f p95 %.1f p99 %.1f max %.1f; >20ms %u, >33ms %u; "
                 "avg ms/frame: backdrop %.2f raster %.2f legacy-copy %.2f compose %.2f present %.2f menu %.2f; "
-                "menu backdrop rebuilds %u (worst %.1f ms, total %.1f ms); gpu-submit %.2f",
+                "menu backdrop rebuilds %u (worst %.1f ms, total %.1f ms); gpu-submit %.2f; %s",
                 width,height,n,sorted[n/2],sorted[std::min(n-1,n*95/100)],sorted[std::min(n-1,n*99/100)],sorted[n-1],slow,veryslow,
                 stage[StageBackdrop]*1000.0/frequency/n,stage[StageRaster]*1000.0/frequency/n,
                 stage[StageLegacy]*1000.0/frequency/n,stage[StageCompose]*1000.0/frequency/n,stage[StagePresent]*1000.0/frequency/n,
                 stage[StageMenu]*1000.0/frequency/n,rebuilds,worstRebuild*1000.0/frequency,stage[StageMenuBackdrop]*1000.0/frequency,
-                stage[StageGpu]*1000.0/frequency/n);
+                stage[StageGpu]*1000.0/frequency/n,gpuTimeText);
             status(message);
         }
         intervals.clear();std::memset(stage,0,sizeof stage);rebuilds=0;worstRebuild=0;reportStart=end;
@@ -608,6 +672,19 @@ void viewport(int cw,int ch) {
     }
     for(int y=0;y<h;++y) {
         int p=int(std::floor((y+0.5-oy)/ui));mapY[y]=(p>=0 && p<480)?p:-1;
+    }
+    menuCacheValid=false;
+    if(smoothUi) {   // bilinear sampling positions of the menu picture (8-bit weights)
+        auto fill=[ui](std::vector<int>& i0,std::vector<int>& i1,std::vector<unsigned>& weight,int count,double origin,int size) {
+            i0.resize(count);i1.resize(count);weight.resize(count);
+            for(int i=0;i<count;++i) {
+                double p=(i+0.5-origin)/ui-0.5;int a=int(std::floor(p));unsigned wgt=unsigned(std::lround((p-a)*256.0));
+                if(a<0){a=0;wgt=0;}
+                if(a>=size-1){a=size-1;wgt=0;}
+                i0[i]=a;i1[i]=std::min(a+1,size-1);weight[i]=std::min(256u,wgt);
+            }
+        };
+        fill(smoothX0,smoothX1,smoothWX,w,ox,640);fill(smoothY0,smoothY1,smoothWY,h,oy,480);
     }
     for(int x=0;x<640;++x) sceneX[x]=int(std::floor((x+0.5-320)*sceneScale+w/2.0));
     for(int y=0;y<480;++y) sceneY[y]=std::min(h-1,int((y+0.5)*sceneScale));
@@ -859,7 +936,7 @@ void convertRows(int top,int bottom) {
     for(;i<count;++i)rgba[i]=convertColors[world[i]];
 }
 void compose(const uint8_t* pixels,int pitch,const uint8_t* palette) {
-    gameplayFramePresented=true;
+    gameplayFramePresented=true;menuCacheValid=false;
     uint32_t colors[256];
     for(int i=0;i<256;++i)colors[i]=(uint32_t(palette[i*4])<<16)|(uint32_t(palette[i*4+1])<<8)|palette[i*4+2];
     for(int y=0;y<480;++y)for(int x=0;x<640;++x)beforeText[y*640+x]=colors[pixels[size_t(y)*pitch+x]];
@@ -987,6 +1064,17 @@ void prepareMenuBackdrop(bool dim) {
     menuBackdropDim=dim;menuBackdropDirty=false;
     if(profileEnabled){LONGLONG took=profiler.now()-rebuildStart;profiler.stage[StageMenuBackdrop]+=took;++profiler.rebuilds;profiler.worstRebuild=std::max(profiler.worstRebuild,took);}
 }
+void menuSmoothRows(int top,int bottom) {
+    int left=uiX[0],right=uiX[640];
+    for(int y=std::max(top,uiY[0]);y<std::min(bottom,uiY[480]);++y) {
+        const uint32_t* r0=beforeText.data()+size_t(smoothY0[y])*640;const uint32_t* r1=beforeText.data()+size_t(smoothY1[y])*640;
+        unsigned wy=smoothWY[y];uint32_t* dst=rgba.data()+size_t(y)*width;
+        for(int x=left;x<right;++x) {
+            unsigned wx=smoothWX[x];int a=smoothX0[x],b=smoothX1[x];
+            dst[x]=mixColor(mixColor(r0[a],r0[b],wx),mixColor(r1[a],r1[b],wx),wy);
+        }
+    }
+}
 void composeMenu(const void* pixels,int pitch,int r,int g,int b) {
     if(menuBright.size()!=640*480) return;
     LONGLONG menuStart=profileEnabled?profiler.now():0;
@@ -1002,6 +1090,17 @@ void composeMenu(const void* pixels,int pitch,int r,int g,int b) {
     for(int y=0;y<480;++y)for(int x=0;x<640;++x) {
         size_t i=y*640+x;uint16_t p=reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(pixels)+size_t(y)*pitch)[x];
         beforeText[i]=color16[p];
+    }
+    if(smoothUi && smoothWX.size()==size_t(width) && smoothWY.size()==size_t(height)) {
+        // the menu picture rarely changes: rebuild the smoothed frame only when it (or the window) did
+        uint64_t hash=1469598103934665603ull^(dim?0x9e3779b97f4a7c15ull:0);
+        for(size_t i=0;i<beforeText.size();++i)hash=(hash^beforeText[i])*1099511628211ull;
+        if(!menuCacheValid || hash!=menuCacheHash) {
+            std::memcpy(rgba.data(),menuBackdrop.data(),rgba.size()*4);
+            parallelRows(menuSmoothRows);
+            menuCacheHash=hash;menuCacheValid=true;
+        }
+        displayReady=true;profiler.add(StageMenu,menuStart);return;
     }
     std::memcpy(rgba.data(),menuBackdrop.data(),rgba.size()*4);
     int previous=-1,left=uiX[0],right=uiX[640];
@@ -1073,6 +1172,27 @@ void gpuCompareWithCpu(const std::vector<uint32_t>& gpuPixels) {
         seen?(std::string(" (first strong diff at ")+std::to_string(firstX)+","+std::to_string(firstY)+")").c_str():"");
     status(m);
 }
+// Quality=Auto: watch how long a race frame takes to build and present. When the average stays above the budget
+// the next lower render height is stored in RoadRashHD.ini ([Graphics] AutoRenderHeight) and used from the next start
+// (changing the resolution in the middle of a race is not safe for the game).
+bool autoQuality=false;
+double autoFrameSum=0;int autoFrameCount=0,autoSlowWindows=0;bool autoDecided=false;
+void autoQualityFrame(double ms) {
+    if(!autoQuality || autoDecided)return;
+    autoFrameSum+=ms;
+    if(++autoFrameCount<600)return;                       // about 10 s of racing per window
+    double mean=autoFrameSum/autoFrameCount;autoFrameSum=0;autoFrameCount=0;
+    autoSlowWindows=mean>12.5?autoSlowWindows+1:0;       // budget: 12.5 of 16.7 ms
+    if(autoSlowWindows<2)return;                          // two slow windows in a row
+    static const int steps[]={1440,1080,900,720,540,480};
+    int next=0;
+    for(int s:steps)if(s<height){next=s;break;}
+    autoDecided=true;
+    if(next>0) {
+        WritePrivateProfileStringW(L"Graphics",L"AutoRenderHeight",std::to_wstring(next).c_str(),configPath.c_str());
+        char m[200];std::snprintf(m,sizeof m,"auto quality: %.1f ms per frame is over budget at %dp; next start will render at %dp",mean,height,next);status(m);
+    }
+}
 bool gpuPresent() {
     // The swap chain exists only while a race is on screen. Menus, text screens and videos keep using the
     // GDI path so nothing else (Media Foundation, the game's own window changes) ever meets a flip-model chain.
@@ -1082,6 +1202,7 @@ bool gpuPresent() {
     }
     if(!ensureGpu())return false;
     gpu.beginFrame();
+    LARGE_INTEGER autoT0{};if(autoQuality)QueryPerformanceCounter(&autoT0);
     rrhd::GpuFrameInfo info{};
     info.viewW=float(width);info.viewH=float(height);info.sceneScale=float(sceneScale);info.halfW=float(width/2.0);
     info.horizonW=horizonWidth;info.horizonRows=horizonRows;info.horizonScroll=horizonScroll;info.horizonY=horizonY;
@@ -1108,10 +1229,14 @@ bool gpuPresent() {
     if(uiDirtyMax>=0) {
         static std::vector<uint32_t> layer(640*480);
         for(size_t i=0;i<layer.size();++i)layer[i]=uiMask[i]?(0xff000000u|uiColorBuf[i]):0u;
-        gpu.drawUi(info,layer.data(),true);   // the UI layer is drawn flat (nearest), never smoothed
+        gpu.drawUi(info,layer.data(),!smoothUi);   // flat (nearest) unless [Graphics] SmoothText=1
         clearUiMask();
     }
     bool ok=gpu.present(gpuVSync);
+    if(autoQuality && autoT0.QuadPart) {
+        LARGE_INTEGER t1,f;QueryPerformanceCounter(&t1);QueryPerformanceFrequency(&f);
+        autoQualityFrame(1000.0*double(t1.QuadPart-autoT0.QuadPart)/double(f.QuadPart));
+    }
     gpuSceneReady=false;
     return ok;
 }
@@ -1428,6 +1553,7 @@ DWORD WINAPI padDialogThread(LPVOID context) {
 using MessageBoxFn=int(WINAPI*)(HWND,LPCSTR,LPCSTR,UINT);
 MessageBoxFn originalMessageBox=nullptr;
 int WINAPI messageBoxHook(HWND owner,LPCSTR text,LPCSTR caption,UINT type) {
+    StyleScope scope;
     if(!padDialogs)return originalMessageBox(owner,text,caption,type);
     PadDialogState state{GetCurrentThreadId(),0};
     InterlockedIncrement(&padBlock);
@@ -1579,10 +1705,19 @@ bool initialize(HMODULE module) {
         if(match)ok=branch(0x43f9f0,reinterpret_cast<void*>(&languageHook),0xe9)&&ok;
         else status("language setting ignored: unexpected start-up code");
     }
-    if(autoHideCursor) {
+    {
         void* original=nullptr;
         if(hookImport(0x61c6f8,L"user32.dll","CreateWindowExA",reinterpret_cast<void*>(&createWindowHook),&original))originalCreateWindow=reinterpret_cast<CreateWindowFn>(original);
-        hookImport(0x61c714,L"user32.dll","SetCursor",reinterpret_cast<void*>(&setCursorHook));
+        if(autoHideCursor)hookImport(0x61c714,L"user32.dll","SetCursor",reinterpret_cast<void*>(&setCursorHook));
+    }
+    themeThread();
+    {
+        void* original=nullptr;   // window mode switch from the game menu, themed file dialogs
+        if(hookImport(0x61c734,L"user32.dll","SetWindowPos",reinterpret_cast<void*>(&setWindowPosHook),&original))originalSetWindowPos=reinterpret_cast<SetWindowPosFn>(original);
+        original=nullptr;
+        if(hookImport(0x61c0b4,L"comdlg32.dll","GetOpenFileNameA",reinterpret_cast<void*>(&getOpenFileNameHook),&original))originalOpenFile=reinterpret_cast<OpenFileFn>(original);
+        original=nullptr;
+        if(hookImport(0x61c0b8,L"comdlg32.dll","GetSaveFileNameA",reinterpret_cast<void*>(&getSaveFileNameHook),&original))originalSaveFile=reinterpret_cast<OpenFileFn>(original);
     }
     {
         void* original=nullptr;   // the game's own XInputGetState import (it reports a pad with nothing pressed while a dialog is open)
@@ -1613,6 +1748,33 @@ bool initialize(HMODULE module) {
 // Read by the installer/launcher (it scans the file for this tag) to tell which MultiFix version is in the game folder.
 extern "C" __declspec(dllexport) const char RRHD_VersionTag[]="RRHD_VERSION_TAG:" RRHD_VERSION;
 
+// [Performance] HighPerformance=1: ask Windows to treat the game as a foreground, full-speed workload.
+//  * EcoQoS / execution-speed throttling off (hybrid laptops and Windows 11 otherwise may clock the process down),
+//  * timer-resolution throttling off and a 1 ms system timer (accurate Sleep and frame limiter),
+//  * slightly raised priority (ABOVE_NORMAL, never HIGH so the system stays responsive).
+// The GPU's own power mode is a driver-wide setting (Intel Graphics Command Center) that no program can change.
+static void applyPerformanceProfile() {
+    struct PowerState{ULONG Version,ControlMask,StateMask;};
+    HMODULE kernel=GetModuleHandleW(L"kernel32.dll");
+    typedef BOOL(WINAPI* SetProcessInfoFn)(HANDLE,int,LPVOID,DWORD);
+    auto setInfo=kernel?reinterpret_cast<SetProcessInfoFn>(GetProcAddress(kernel,"SetProcessInformation")):nullptr;
+    bool throttleOff=false;
+    if(setInfo) {
+        PowerState s{1,0x1|0x4,0};                       // EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION, state 0 = never throttle
+        throttleOff=setInfo(GetCurrentProcess(),4/*ProcessPowerThrottling*/,&s,sizeof s)!=FALSE;
+        if(!throttleOff){s.ControlMask=0x1;throttleOff=setInfo(GetCurrentProcess(),4,&s,sizeof s)!=FALSE;} // Windows 10 before 11
+    }
+    bool priority=SetPriorityClass(GetCurrentProcess(),ABOVE_NORMAL_PRIORITY_CLASS)!=FALSE;
+    bool timer=false;
+    if(HMODULE mm=LoadLibraryW(L"winmm.dll")) {
+        typedef UINT(WINAPI* BeginPeriodFn)(UINT);
+        if(auto begin=reinterpret_cast<BeginPeriodFn>(GetProcAddress(mm,"timeBeginPeriod")))timer=begin(1)==0;
+    }
+    char m[200];std::snprintf(m,sizeof m,"performance profile: power throttling %s, 1 ms timer %s, priority above normal %s",
+        throttleOff?"off":"unchanged",timer?"on":"unavailable",priority?"on":"unavailable");
+    status(m);
+}
+
 extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
         reinterpret_cast<LPCWSTR>(&RRHD_Init),&rendererModule);
@@ -1621,6 +1783,20 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     configPath=directory+L"RoadRashHD.ini";logPath=directory+L"RoadRashHD.log";
     enabled=GetPrivateProfileIntW(L"Graphics",L"Enabled",1,configPath.c_str())!=0;
     renderHeight=GetPrivateProfileIntW(L"Graphics",L"RenderHeight",0,configPath.c_str());
+    if(renderHeight<=0) {   // Quality preset: used only while no fixed RenderHeight is set
+        wchar_t q[24]{};GetPrivateProfileStringW(L"Graphics",L"Quality",L"High",q,24,configPath.c_str());
+        if(!_wcsicmp(q,L"Medium"))renderHeight=720;
+        else if(!_wcsicmp(q,L"Low"))renderHeight=540;
+        else if(!_wcsicmp(q,L"Minimum"))renderHeight=480;
+        else if(!_wcsicmp(q,L"Auto")) {
+            autoQuality=true;
+            renderHeight=GetPrivateProfileIntW(L"Graphics",L"AutoRenderHeight",0,configPath.c_str());
+        }
+        if(renderHeight>0){char m[120];std::snprintf(m,sizeof m,"quality preset: render height %d",renderHeight);status(m);}
+    }
+    if(GetPrivateProfileIntW(L"Performance",L"HighPerformance",1,configPath.c_str())!=0)applyPerformanceProfile();
+    gpu.lowLatency=GetPrivateProfileIntW(L"Performance",L"LowLatency",0,configPath.c_str())!=0;
+    gpu.allowTearing=gpu.lowLatency;
     profileEnabled=GetPrivateProfileIntW(L"Graphics",L"Profile",0,configPath.c_str())!=0;
     asyncControllerScan=GetPrivateProfileIntW(L"Input",L"AsyncControllerScan",1,configPath.c_str())!=0;
     fixSteering=GetPrivateProfileIntW(L"Input",L"SymmetricSteering",1,configPath.c_str())!=0;
@@ -1631,8 +1807,10 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     gpuRequested=GetPrivateProfileIntW(L"Graphics",L"D3D11",1,configPath.c_str())!=0;
     configFilter=gpuRequested && GetPrivateProfileIntW(L"Graphics",L"TextureFilter",1,configPath.c_str())!=0;
     gpuVSync=GetPrivateProfileIntW(L"Graphics",L"VSync",0,configPath.c_str())!=0?1:0;
+    smoothUi=GetPrivateProfileIntW(L"Graphics",L"SmoothText",0,configPath.c_str())!=0;
     gpuCompare=GetPrivateProfileIntW(L"Debug",L"CompareGpu",0,configPath.c_str())!=0;
     gpu.log=&status;
+    gpu.timing=profileEnabled;
     {   // Wine / Proton: the swap chain goes on the game window itself (the child-window arrangement is a workaround
         // for the Windows DWM); [Graphics] ChildSurface=1/0 overrides the automatic choice.
         typedef const char*(__cdecl* WineVersion)();

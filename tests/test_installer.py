@@ -64,7 +64,7 @@ def run(original_dir):
         window_test = build / 'window_test.exe'
         subprocess.run([str(compiler), '/nologo', '/utf8output', '/out:' + str(window_test),
                         '/win32manifest:' + str(ROOT / 'app.manifest'),
-                        '/reference:System.Windows.Forms.dll', '/reference:System.Drawing.dll',
+                        '/reference:System.Windows.Forms.dll', '/reference:System.Drawing.dll', '/reference:System.IO.Compression.dll',
                         str(ROOT / 'tests/test_window.cs')], check=True)
         missing = fixture('missing game', False)
         assert 'game folder' in execute(missing, success=False)
@@ -73,7 +73,7 @@ def run(original_dir):
 
         game = fixture('gog path with spaces')
         subprocess.run([str(window_test), str(game / 'HD_Resolution_Patch.exe'), str(build / 'window-gog.png')],
-                       cwd=unrelated_cwd, check=True, timeout=30)
+                       cwd=unrelated_cwd, check=True, timeout=30, env=dict(os.environ, RRMF_NO_UPDATE_CHECK='1'))
         checks.append('GUI shows folder, options and Install/Restore, and opening it writes nothing')
         assert 'MultiFix installed' in execute(game)
         assert (game / 'ddraw.dll').read_bytes() == proxy and (game / 'RoadRashMultiFix.dll').read_bytes() == renderer

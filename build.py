@@ -68,7 +68,7 @@ def build(vcvarsall, tests):
                     '/resource:' + str(ROOT / 'app.ico') + ',app.ico',
                     '/resource:' + str(ROOT / 'docs/logo.png') + ',logo.png',
                     '/resource:' + str(ROOT / 'RoadRashHD.ini') + ',RoadRashHD.ini',
-                    '/resource:' + str(ROOT / 'LICENSE') + ',LICENSE', '/reference:System.Windows.Forms.dll', '/reference:System.Drawing.dll',
+                    '/resource:' + str(ROOT / 'LICENSE') + ',LICENSE', '/reference:System.Windows.Forms.dll', '/reference:System.Drawing.dll', '/reference:System.IO.Compression.dll',
                     str(ROOT / 'PatchWindow.cs'),
                     str(ROOT / 'Installer.cs'), str(work / 'Version.cs')], check=True)
     manifest = {'renderer_version': 5, 'installer_version': version, 'exe_modified': False, 'license': 'PolyForm-Noncommercial-1.0.0',

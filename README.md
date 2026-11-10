@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/logo.png" width="420" alt="Road Rash 30 MultiFix"></p>
 
-<p align="center"><b>v2.16.0</b> &nbsp;|&nbsp; <a href="https://github.com/magoowa/RoadRash30-MultiFix/releases/latest"><b>Download the latest release</b></a> &nbsp;|&nbsp; <a href="CHANGELOG.md">Changelog</a></p>
+<p align="center"><b>v2.17.2</b> &nbsp;|&nbsp; <a href="https://github.com/magoowa/RoadRash30-MultiFix/releases/latest"><b>Download the latest release</b></a> &nbsp;|&nbsp; <a href="CHANGELOG.md">Changelog</a></p>
 
 Fixes, widescreen and a Direct3D 11 renderer for **Road Rash: 30th Anniversary Edition** (GOG, EA app and Steam). Authors: **OBLPlife** (original author) and **magoowa**.
 
@@ -16,7 +16,7 @@ A GOG-compatible rework of [OBLPlife/RoadRash30th-HD](https://github.com/OBLPlif
 2. Double-click the EXE and select **Install**. If the game is in `C:\Program Files` or `C:\Program Files (x86)`, right-click the EXE and choose **Run as administrator**.
 3. Launch the game as usual (GOG Galaxy or the desktop shortcut). Resolution is detected automatically; adjust it under **Graphics and Sound → Race Resolution** if desired.
 
-Install copies `ddraw.dll`, `RoadRashMultiFix.dll` and (if missing) `RoadRashHD.ini` into the game folder. If you already have a different `ddraw.dll` there, it is saved to `ResolutionPatch_Backup` and put back on **Restore**. To restore, open the same EXE and select **Restore**, or run it with `/restore`. `/quiet` suppresses dialogs. You can also remove the patch by simply deleting `ddraw.dll` and `RoadRashMultiFix.dll`.
+Install copies `ddraw.dll`, `RoadRashMultiFix.dll` and (if missing) `RoadRashHD.ini` into the game folder. If a different `ddraw.dll` (another wrapper) is already there, it is kept next to the new one as `ddraw.dll.multifix-backup` and put back on **Restore**; no backup folder is created (an old `ResolutionPatch_Backup` folder from earlier versions is migrated and removed). To restore, open the same EXE and select **Restore**, or run it with `/restore`. `/quiet` suppresses dialogs. You can also remove the patch by simply deleting `ddraw.dll` and `RoadRashMultiFix.dll`.
 
 ### GOG notes
 
@@ -78,15 +78,18 @@ All options are in `RoadRashHD.ini` (game folder) and in the installer/launcher 
 | `[Graphics]` | `D3D11` | 1 | Direct3D 11 hardware renderer. Falls back to the CPU renderer automatically if it cannot start; `0` forces the CPU renderer. |
 | `[Graphics]` | `TextureFilter` | 1 | Smooth (bilinear) textures of the 3D game environment in races (road, buildings, sky). Direct3D renderer only; menus and text are not touched by this option (see `SmoothText`). |
 | `[Graphics]` | `SmoothText` | 0 | Bilinear filtering of the text and the interface instead of crisp pixels: the menus (the 640x480 menu picture is sampled bilinearly into the window) and the race HUD and text layer (Direct3D renderer). Ini only, not shown in the launcher. |
+| `[Graphics]` | `HideHud` | 0 | Start with the text and HUD layer (names, bars, messages) hidden; **F10** switches it during the game (`[Input] HudToggleKey`). |
 | `[Graphics]` | `Quality` | High | Resolution preset for weaker graphics: High = window size, Medium = 720p, Low = 540p, Minimum = 480p, Auto = starts at window size and, when races run slower than 12.5 ms per frame twice in a row (about 10 s each), lowers the height for the next start (`AutoRenderHeight`). A fixed `RenderHeight` overrides it. Ini only. |
 | `[Performance]` | `HighPerformance` | 1 | Turns off Windows power throttling (EcoQoS) for the game, requests a 1 ms timer and raises the priority slightly (above normal). Helps laptops and integrated GPUs. |
-| `[Performance]` | `LowLatency` | 0 | Keep it at 0: performance boost on battery-powered Intel iGPU. With 1 (waitable swap chain with one queued frame and a tearing present) an Intel Iris Xe laptop on battery dropped from 60 to 45 fps. Launcher: **Intel iGPU Battery Boost** (on = 0). |
+| `[Performance]` | `LowLatency` | 0 | Keep it at 0: performance boost on battery-powered Intel iGPU. With 1 (waitable swap chain with one queued frame and a tearing present) an Intel Iris Xe laptop on battery dropped from 60 to 45 fps. Launcher: **iGPU Performance Boost** (on = 0). |
 | `[Graphics]` | `VSync` | 0 | Waits for the monitor refresh before showing each frame: no tearing, slightly more latency. |
-| `[Window]` | `WideWindow` | 1 | Plays the whole game in widescreen (a wide field of view, and a 16:9 window when not fullscreen) instead of the original 4:3. |
+| `[Window]` | `WideWindow` | 1 | Widescreen game: the whole game fills the window or screen with a wide field of view, whatever its shape. 0 = the original 4:3 picture (a 4:3 window; in fullscreen or a wider window it is centred with black bars, no extended backgrounds). |
 | `[Window]` | `AltEnterFullscreen` | 1 | Alt+Enter and F11 switch between window and borderless fullscreen. |
 | `[Window]` | `AutoHideCursor` | 1 | Hides the mouse cursor at start and after 3 s without mouse movement; it returns when the mouse moves. |
 | `[Window]` | `StartFullscreen` | 1 | Starts in fullscreen instead of a window. |
 | `[Text]` | `FixEncoding` | 1 | Fixes garbled special characters (for example `Rashâ„¢` instead of the trademark sign, or `â€œEnderâ€` instead of curly quotes). The game reads its strings with `LoadStringA`, which returns UTF-8 when Windows uses the "Use Unicode UTF-8 for worldwide language support" setting, while the game's bitmap font expects Windows-1252. |
+| `[Input]` | `KeyboardAndPad` | 1 | Keyboard and controller work at the same time, whatever control device the loaded profile has selected (the original game reads only the selected one); missing pad assignments of a keyboard profile are filled in with the game's defaults. Launcher: **Keyboard + Controller Together**. |
+| `[Input]` | `HudToggleKey` | 1 | **F10** hides / shows the text and HUD layer (names, bars, messages) during the game. 0 = F10 does nothing. |
 | `[Input]` | `AsyncControllerScan` | 1 | Stutter fix: searches for controllers in a background thread. On the game thread it opened every HID device every two seconds, and one slow device froze the game for ~165 ms (credits, menus, races). |
 | `[Input]` | `SymmetricSteering` | 1 | Analog stick steering: right turn is as gentle as left (the original mapping made right about twice as sensitive). |
 | `[Game]` | `Language` | Auto | Game text language: `Auto` (the game's own setting), `English`, `French`, `German`, `Italian` or `Spanish`. Needs the matching DLL in the game's TEXT folder. |
@@ -95,6 +98,7 @@ All options are in `RoadRashHD.ini` (game folder) and in the installer/launcher 
 | `[Game]` | `FixPostcards` | 1 | Repairs the broken left strip of the GAME LOADING picture. |
 | `[Game]` | `FixBikeColors` | 1 | Gives the Rat and Super bikes their correct colours in the race. |
 | `[Game]` | `SkipIntro` | 0 | Skips the studio logos and the intro movie; the menu music still plays. |
+| `[Game]` | `RememberLastSave` | 1 | The Load Game dialog opens with the save used last already selected (`LastSave`, written by the game). The controller works the Open / Save as dialogs: D-pad up / down choose, A opens, B cancels (`[Input] PadDialogs`). |
 | `[Game]` | `VideoVolume` | 100 | Volume of all videos (.avi and .mp4) in percent of the game's volume (launcher: FMV Volume slider). |
 
 Advanced options, not shown in the launcher (add them to the ini):

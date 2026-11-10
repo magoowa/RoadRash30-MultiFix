@@ -51,11 +51,16 @@ def version_resource(path, original_name, description):
     Path(path).write_text(text, encoding='utf-8')
 
 
-def build(vcvarsall, tests):
+def build(vcvarsall, tests, release=False):
     work = ROOT / 'build'
     work.mkdir(exist_ok=True)
     version = mod_version()
-    (work / 'Version.cs').write_text('internal static class ModInfo { public const string Version = "%s"; public const string Name = "RoadRash30-MultiFix"; }\n' % version, encoding='utf-8')
+    # Test builds carry a date code (shown in the window title, the log and the launcher), so it is obvious which build runs.
+    import datetime
+    stamp = '' if release else datetime.datetime.now().strftime('%Y%m%d-%H%M')
+    suffix = '' if release else ' test ' + stamp
+    (work / 'hd_build.hpp').write_text('#define RRHD_BUILD_STAMP "%s"' % stamp + chr(10) + '#define RRHD_BUILD_SUFFIX "%s"' % suffix + chr(10), encoding='utf-8')
+    (work / 'Version.cs').write_text('internal static class ModInfo { public const string Version = "%s"; public const string Name = "RoadRash30-MultiFix"; public const string Build = "%s"; public const string BuildSuffix = "%s"; }' % (version, stamp, suffix) + chr(10), encoding='utf-8')
     (ROOT / 'dist').mkdir(exist_ok=True)
     version_resource(work / 'renderer_version.rc', 'RoadRashMultiFix.dll', 'RoadRash30-MultiFix renderer and game fixes')
     version_resource(work / 'ddraw_version.rc', 'ddraw.dll', 'RoadRash30-MultiFix loader (ddraw.dll proxy that loads RoadRashMultiFix.dll)')
@@ -111,5 +116,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--vcvarsall', type=Path, help='optional explicit path to vcvarsall.bat')
     parser.add_argument('--tests', action='store_true', help='also compile offscreen renderer tests')
+    parser.add_argument('--release', action='store_true', help='release build: no test date code in the title, log and launcher')
     args = parser.parse_args()
-    build(args.vcvarsall, args.tests)
+    build(args.vcvarsall, args.tests, args.release)

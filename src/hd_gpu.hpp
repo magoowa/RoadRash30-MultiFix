@@ -46,12 +46,15 @@ struct GpuFrameInfo {       // constant buffer (b0), 16-byte multiples
     int32_t horizonW, horizonRows, horizonScroll, horizonY;
     float uiScale, uiOx, uiOy, uiFlat;
     float uiX0, uiX1, uiY0, uiY1;      // fitted 640x480 area in output pixels
-    float backdropFilter, presentW, presentH, padC; // backdropFilter: 1 = bilinear sky/backdrop; presentW/H: back buffer size while presenting
+    float backdropFilter, presentW, presentH, padC; // backdropFilter: 1 = bilinear sky/backdrop; presentW/H: size of the area the scene is stretched over while presenting
+    float presentX, presentY, padD, padE;           // top-left of that area in back-buffer pixels
 };
 
 class GpuRenderer {
 public:
     GpuFrameInfo lastInfo{};
+    // Where the picture goes in the window (client pixels). 0 size = the whole window. A smaller box leaves black bars.
+    int boxX = 0, boxY = 0, boxW = 0, boxH = 0;
     void (*log)(const char*) = nullptr;
     // true: the swap chain lives on a child window of the game window (Windows: keeps the DWM from holding on to the
     // last flip-model frame). false: the swap chain is created on the game window itself (the usual path under Wine/Proton).
@@ -403,9 +406,12 @@ public:
                 log(m);
             }
         }
-        { GpuFrameInfo copy = lastInfo; copy.presentW = float(backW); copy.presentH = float(backH); updateFrameInfo(copy); }
-        D3D11_VIEWPORT vp{ 0, 0, float(backW), float(backH), 0, 1 };
+        bool boxed = boxW > 0 && boxH > 0 && boxX >= 0 && boxY >= 0 && boxX + boxW <= backW && boxY + boxH <= backH && (boxW != backW || boxH != backH);
+        { GpuFrameInfo copy = lastInfo; copy.presentW = float(boxed ? boxW : backW); copy.presentH = float(boxed ? boxH : backH);
+          copy.presentX = boxed ? float(boxX) : 0.0f; copy.presentY = boxed ? float(boxY) : 0.0f; updateFrameInfo(copy); }
+        D3D11_VIEWPORT vp = boxed ? D3D11_VIEWPORT{ float(boxX), float(boxY), float(boxW), float(boxH), 0, 1 } : D3D11_VIEWPORT{ 0, 0, float(backW), float(backH), 0, 1 };
         ctx->OMSetRenderTargets(1, &backRTV, nullptr);
+        if (boxed) { const float black[4] = { 0, 0, 0, 1 }; ctx->ClearRenderTargetView(backRTV, black); }   // the bars
         ctx->RSSetViewports(1, &vp);
         ctx->VSSetShader(vsFull, nullptr, 0);
         ctx->PSSetShader(psPresent, nullptr, 0);

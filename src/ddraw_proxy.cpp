@@ -17,6 +17,9 @@
 #include <cstring>
 #include <string>
 
+// Read by the installer/launcher to tell this proxy from another ddraw.dll wrapper.
+extern "C" __declspec(dllexport) const char RRMF_ProxyTag[]="RRMF_PROXY_TAG";
+
 static FARPROC g_real[23];
 static HMODULE g_self, g_exe;
 static volatile LONG g_initialized;

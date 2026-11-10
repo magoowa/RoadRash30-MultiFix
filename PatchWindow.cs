@@ -296,7 +296,8 @@ internal sealed class PatchWindow : Form
             if (vertical) width += SystemInformation.VerticalScrollBarWidth;
             if (horizontal) height += SystemInformation.HorizontalScrollBarHeight;
         }
-        scroll.AutoScrollMinSize = new Size(wanted.Width, wanted.Height);
+        scroll.AutoScrollMinSize = new Size(horizontal ? wanted.Width : 0, wanted.Height);
+        if (!recenter) { width = Math.Max(width, ClientSize.Width); height = Math.Max(height, ClientSize.Height); }   // refitting only grows the window
         ClientSize = new Size(Math.Min(width, maxWidth), Math.Min(height, maxHeight));
         if (recenter) Location = new Point(area.Left + Math.Max(0, (area.Width - Width) / 2), area.Top + Math.Max(0, (area.Height - Height) / 2));
         else Location = new Point(Location.X, Math.Max(area.Top, Math.Min(Location.Y, area.Bottom - Height)));
@@ -305,11 +306,12 @@ internal sealed class PatchWindow : Form
     // The status line appears below the options: grow the window by its height (once) so nothing needs a scroll bar.
     void Say(string text)
     {
-        bool first = !status.Visible;
         status.Text = text; status.Visible = true;
-        if (first && IsHandleCreated && fitRoot != null) FitToScreen(fitRoot, fitBar, fitScroll, false);
+        Refit();
     }
     Control fitRoot, fitBar; ScrollableControl fitScroll;
+    // The content changed (status line, info rows after a download or an install): let the window grow so no scroll bar appears.
+    void Refit() { if (IsHandleCreated && fitRoot != null) FitToScreen(fitRoot, fitBar, fitScroll, false); }
 
     void SetFolder(string folder)
     {
@@ -447,6 +449,7 @@ internal sealed class PatchWindow : Form
         infoTable.ResumeLayout();
         bool game = System.IO.File.Exists(System.IO.Path.Combine(path.Text ?? "", "RoadRash95.exe"));
         play.Enabled = install.Enabled = restore.Enabled = game;
+        Refit();
     }
     void Play()
     {

@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.17.2
+
+- **No backup folder:** the installer no longer creates `ResolutionPatch_Backup`. A different `ddraw.dll` that was in the way is kept next to the new one as `ddraw.dll.multifix-backup` (and put back on Restore); nothing else is stored. Our own files are recognised by a tag inside them. An older install is migrated (a saved original becomes the `.multifix-backup` file) and its backup folder is removed.
+- **F10 hides / shows the HUD** (names, bars, messages) during the game (`[Input] HudToggleKey`; `[Graphics] HideHud` sets the start state).
+- **Keyboard + Controller Together** (`[Input] KeyboardAndPad`, launcher option, on by default): the game read only the control device saved in the profile, so a profile set to the keyboard ignored the pad in a race. Both are read now, and missing pad assignments of a keyboard profile are filled in with the game's defaults.
+- **Hotkeys fixed:** F11, Alt+Enter and Alt+F4 also work when the key message does not reach the game window (the keys are watched as well).
+- **Videos follow the window:** after F11 / Alt+Enter the game is told whether it is windowed, so videos play in the window and not over the whole screen. A window made from fullscreen is 4:3 when Widescreen is off.
+- **Race Resolution** list: 4:3 choices with Widescreen off; the controller operates the dialog directly (D-pad, A, B).
+- **Widescreen Game switch fixed:** with it off (`[Window] WideWindow=0`) the game now plays in the original 4:3 aspect.
+- **Load Game remembers the last save** (`[Game] RememberLastSave`, on by default): the Open dialog starts with the save you used last already selected (the name is kept in `[Game] LastSave` after every Open or Save as).
+- **Test builds carry a date code** (title, log, launcher); `build.py --release` leaves it out.
+- **iGPU Performance Boost:** the launcher option formerly called "Intel iGPU Battery Boost" has a clearer name (same setting, `[Performance] LowLatency`); the "Widescreen" option no longer says 16:9.
+- **Launcher:** after a netplay download (or any change of the information rows) the window grows with its content instead of showing a horizontal scroll bar.
+
 ## 2.16.0
 
 - **High Performance mode** (`[Performance] HighPerformance`, launcher option, on by default): Windows power throttling (EcoQoS) off for the game, 1 ms timer, priority slightly above normal. Meant for laptops and integrated GPUs; no measurable difference on a machine that already held 60 fps.
@@ -31,7 +45,7 @@
 - **Auto-hide mouse cursor** (`[Window] AutoHideCursor`): the cursor is hidden from the first window, comes back when the mouse moves, hides again after 3 s, does not flicker in the menus, and stays visible in the "Save as..." dialog and message boxes.
 - **Language selection** (`[Game] Language`): the launcher lists the languages found in the TEXT folder and saves the choice to the ini; no administrator rights or registry editing needed.
 - **Start in Fullscreen is on by default** for new installations.
-- **Launcher:** new logo and icon, language selector as a row of radio buttons under the MultiFix line, aligned layout, controller options grouped above the cursor option, consistent option names, the description moved to the bottom, and a clearer "Widescreen (16:9) Game" option that says the whole game runs in widescreen, not only the window at start.
+- **Launcher:** new logo and icon, language selector as a row of radio buttons under the MultiFix line, aligned layout, controller options grouped above the cursor option, consistent option names, the description moved to the bottom, and a clearer "Widescreen Game" option that says the whole game runs in widescreen, not only the window at start.
 - The installer file name now contains the version (`RoadRash_MultiFix_Setup_v2.14.2.exe`).
 
 **Changed**

@@ -80,6 +80,13 @@ internal static class WindowTest
                 typeof(Form).GetMethod("OnActivated", BindingFlags.NonPublic | BindingFlags.Instance).Invoke(window, new object[] { EventArgs.Empty });
                 if (!filter.Checked) throw new InvalidOperationException("An external ini change was not picked up on activation");
                 File.Delete(iniPath);
+                {   // a status line and new info rows (after a netplay download) must not bring up a horizontal scroll bar
+                    var say = window.GetType().GetMethod("Say", BindingFlags.NonPublic | BindingFlags.Instance);
+                    say.Invoke(window, new object[] { "Netplay installed from oldkid.net: wsock32.dll, netcheck.exe, okplay.ini and oldkid_netplay_readme.txt are in the game folder." });
+                    for (int i = 0; i < 5; ++i) Application.DoEvents();
+                    var scrollPanel = (ScrollableControl)window.Controls.Find("ScrollPanel", true)[0];
+                    if (scrollPanel.HorizontalScroll.Visible) throw new InvalidOperationException("A status line must not bring up a horizontal scroll bar");
+                }
                 // One margin: the content blocks and the button bar start at the same left edge, links and the logo click are wired.
                 {
                     var rootPanel = window.Controls.Find("RootPanel", true)[0];
@@ -125,14 +132,14 @@ internal static class WindowTest
                         if (window.Controls.Find("NetplayLink", true).Length != 0) throw new InvalidOperationException("The OKPlay link must disappear when wsock32.dll is there");
                     }
                     finally { try { Directory.Delete(gameFolder, true); } catch (Exception) { } }
-                    // "Intel iGPU Battery Boost" is the inverse of [Performance] LowLatency: checked = 0
+                    // "iGPU Performance Boost" is the inverse of [Performance] LowLatency: checked = 0
                     {
                         var optionsField = assembly.GetType("Installer").GetField("Options", BindingFlags.Public | BindingFlags.Static | BindingFlags.NonPublic);
                         var all = (System.Collections.IEnumerable)optionsField.GetValue(null);
                         object boost = null;
                         foreach (object o in all) if ((string)o.GetType().GetField("Key").GetValue(o) == "LowLatency") boost = o;
-                        if (boost == null) throw new InvalidOperationException("The Intel iGPU Battery Boost option is missing");
-                        if ((string)boost.GetType().GetField("Label").GetValue(boost) != "Intel iGPU Battery Boost" || (string)boost.GetType().GetField("Hint").GetValue(boost) != "Turns off Low-Latency Presentation: faster on battery-powered Intel iGPUs")
+                        if (boost == null) throw new InvalidOperationException("The iGPU Performance Boost option is missing");
+                        if ((string)boost.GetType().GetField("Label").GetValue(boost) != "iGPU Performance Boost" || (string)boost.GetType().GetField("Hint").GetValue(boost) != "Turns off Low-Latency Presentation: faster on battery-powered Intel iGPUs")
                             throw new InvalidOperationException("The battery boost option must have the short label and hint");
                         if ((string)boost.GetType().GetField("Label").GetValue(boost) == "" || ((string)boost.GetType().GetField("Hint").GetValue(boost)).Contains("Experimental")) throw new InvalidOperationException("No 'Experimental' in the option text");
                         string iniFolder = Path.Combine(Path.GetTempPath(), "rrmf_boost_" + Guid.NewGuid().ToString("N"));

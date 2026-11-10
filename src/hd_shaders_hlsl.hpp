@@ -12,6 +12,7 @@ cbuffer Frame : register(b0) {
     float uiScale, uiOx, uiOy, uiFlat;
     float uiX0, uiX1, uiY0, uiY1;
     float backdropFilter, presentW, presentH, padC;
+    float presentX, presentY, padD, padE;
 };
 struct Quad { float4 px; float4 py; float4 pu; float4 pv; uint4 info; };
 Texture2D<uint>   legacyTex  : register(t0);
@@ -34,7 +35,7 @@ float4 VSFull(uint id : SV_VertexID) : SV_Position {
 
 float4 PSPresent(float4 pos : SV_Position) : SV_Target {
     // The back buffer can differ from the scene target for a moment (window just resized): always stretch the whole scene over it.
-    return float4(srcTex.SampleLevel(pointSamp, pos.xy / float2(presentW, presentH), 0).rgb, 1);
+    return float4(srcTex.SampleLevel(pointSamp, (pos.xy - float2(presentX, presentY)) / float2(presentW, presentH), 0).rgb, 1);
 }
 float4 PSCopyCpu(float4 pos : SV_Position) : SV_Target {
     return float4(srcTex.Load(int3(int2(pos.xy), 0)).rgb, 1);

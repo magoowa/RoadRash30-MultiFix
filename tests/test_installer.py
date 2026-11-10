@@ -77,8 +77,8 @@ def run(original_dir):
         checks.append('GUI shows folder, options and Install/Restore, and opening it writes nothing')
         assert 'MultiFix installed' in execute(game)
         assert (game / 'ddraw.dll').read_bytes() == proxy and (game / 'RoadRashMultiFix.dll').read_bytes() == renderer
-        assert (game / 'ResolutionPatch_Backup/state.txt').exists()
-        assert not (game / 'ResolutionPatch_Backup/ddraw.dll').exists()
+        assert not (game / 'ResolutionPatch_Backup').exists(), 'no backup folder is created'
+        assert not list(game.glob('*.multifix-backup')), 'nothing was in the way, so nothing is backed up'
         subprocess.run([str(build / 'hd_test.exe'), str(game / 'RoadRash95.exe')], check=True, timeout=60)
         subprocess.run([str(build / 'hd_loader_test.exe'), str(game / 'RoadRash95.exe'), str(game / 'ddraw.dll')],
                        check=True, timeout=60)
@@ -101,9 +101,11 @@ def run(original_dir):
         (foreign / 'ddraw.dll').write_bytes(wrapper)
         execute(foreign)
         assert (foreign / 'ddraw.dll').read_bytes() == proxy
-        assert (foreign / 'ResolutionPatch_Backup/ddraw.dll').read_bytes() == wrapper
+        assert (foreign / 'ddraw.dll.multifix-backup').read_bytes() == wrapper
+        assert not (foreign / 'ResolutionPatch_Backup').exists()
         execute(foreign, '/restore')
         assert (foreign / 'ddraw.dll').read_bytes() == wrapper
+        assert not (foreign / 'ddraw.dll.multifix-backup').exists()
         assert not (foreign / 'RoadRashMultiFix.dll').exists()
         checks.append('existing ddraw.dll backed up and restored exactly')
 
@@ -115,13 +117,28 @@ def run(original_dir):
         checks.append('file replaced after install is never overwritten')
 
         conflict = fixture('different existing backup')
-        old_backup = conflict / 'ResolutionPatch_Backup/ddraw.dll'
-        old_backup.parent.mkdir(); old_backup.write_bytes(b'keep existing backup')
+        old_backup = conflict / 'ddraw.dll.multifix-backup'
+        old_backup.write_bytes(b'keep existing backup')
         (conflict / 'ddraw.dll').write_bytes(b'current wrapper')
         assert 'backup' in execute(conflict, success=False)
         assert old_backup.read_bytes() == b'keep existing backup'
         assert not (conflict / 'RoadRashMultiFix.dll').exists()
         checks.append('conflicting backup retained')
+
+        # an install made by an earlier version (backup folder with a saved original) is migrated and the folder removed
+        migrated = fixture('older install with a backup folder')
+        (migrated / 'ResolutionPatch_Backup').mkdir()
+        (migrated / 'ResolutionPatch_Backup/state.txt').write_bytes(b'RRHD_BACKUP_V2' + chr(10).encode() + b'old' + chr(10).encode())
+        (migrated / 'ResolutionPatch_Backup/ddraw.dll').write_bytes(b'the original wrapper')
+        (migrated / 'ddraw.dll').write_bytes(b'an older MultiFix proxy')
+        (migrated / 'RoadRashMultiFix.dll').write_bytes(b'an older MultiFix renderer')
+        execute(migrated)
+        assert (migrated / 'ddraw.dll').read_bytes() == proxy and (migrated / 'RoadRashMultiFix.dll').read_bytes() == renderer
+        assert (migrated / 'ddraw.dll.multifix-backup').read_bytes() == b'the original wrapper'
+        assert not (migrated / 'ResolutionPatch_Backup').exists(), 'the old backup folder is removed'
+        execute(migrated, '/restore')
+        assert (migrated / 'ddraw.dll').read_bytes() == b'the original wrapper' and not (migrated / 'RoadRashMultiFix.dll').exists()
+        checks.append('an older install is migrated: the saved original is kept as .multifix-backup, the folder is gone')
 
         locked = fixture('ddraw locked by another process')
         (locked / 'ddraw.dll').write_bytes(b'locked wrapper')

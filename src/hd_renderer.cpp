@@ -46,9 +46,13 @@ std::vector<uint32_t> gpuShot;
 uint32_t lastColors[256]{};
 HMODULE rendererModule;
 HWND hookedWindow;
+volatile bool hudHidden=false;   // F10: the text and HUD layer is left out
+bool hudToggleKey=true;           // [Input] HudToggleKey
 WNDPROC previousWindowProc;
 bool completedFrame=false;
 int renderHeight=0, width=0, height=0, clientWidth=0, clientHeight=0, logicalWidth=320;
+bool wideGame=true;                 // [Window] WideWindow: false = the original 4:3 picture, centred, black bars around it
+int boxX=0, boxY=0, boxW=0, boxH=0; // where the picture goes in the client area
 double sceneScale=1, sceneOffset=0;
 bool enabled=true, frameActive=false, begun=false, worldReady=false, displayReady=false;
 uint64_t frames=0, primitives=0, batches=0;
@@ -118,8 +122,10 @@ INT_PTR CALLBACK resolutionDialogProc(HWND window,UINT message,WPARAM wp,LPARAM 
 // keeps polling the pad inside the nested message loop and would act on the same button press (it opened the
 // Race Resolution dialog a second time and could not be closed with the pad). The game's XInputGetState
 // (IAT 0x61c970) reports a pad with nothing pressed while padBlock is set.
-struct PadDialogState{DWORD thread;volatile LONG done;};
+struct PadDialogState{DWORD thread;volatile LONG done;bool files=false;};   // files: the dialogs belong to an Open / Save as dialog
 DWORD WINAPI padDialogThread(LPVOID context);
+bool padDialogs=true;                 // [Input] PadDialogs: the controller answers the game's dialogs
+bool rememberLastSave=true;           // [Game] RememberLastSave: the Load Game dialog starts on the last save used
 // XInput, loaded on demand for the helper threads (the game itself uses its own XInput 9.1.0 import).
 struct XInputPad{DWORD packet;WORD buttons;BYTE lt,rt;SHORT lx,ly,rx,ry;};   // XINPUT_STATE
 DWORD (WINAPI* xinputGetState())(DWORD,void*) {
@@ -144,7 +150,9 @@ int __cdecl resolutionMenuHook() {
     open=true;InterlockedIncrement(&padBlock);
     PadDialogState padState{GetCurrentThreadId(),0};
     HANDLE padThread=CreateThread(nullptr,0,padDialogThread,&padState,0,nullptr);   // the pad operates the dialog
-    ResolutionDialog dialog{r.right,r.bottom,resolutionChoices(r.right,r.bottom,renderHeight)};
+    // The list follows the shape of the picture: the whole window in widescreen, the centred 4:3 box otherwise.
+    int pictureW=boxW>0?boxW:r.right,pictureH=boxH>0?boxH:r.bottom;
+    ResolutionDialog dialog{pictureW,pictureH,resolutionChoices(pictureW,pictureH,renderHeight)};
     if(DialogBoxParamW(rendererModule,MAKEINTRESOURCEW(101),owner,resolutionDialogProc,reinterpret_cast<LPARAM>(&dialog))==IDOK && dialog.chosen>=0) {
         renderHeight=dialog.choices[dialog.chosen].height;
         std::wstring value=std::to_wstring(renderHeight);
@@ -175,8 +183,8 @@ void setWindowedSize(HWND window) {
     int extraW=frame.right-frame.left,extraH=frame.bottom-frame.top;
     int cw=windowWidth,ch=windowHeight;
     if(cw<=0 || ch<=0) {
-        ch=(workH-extraH)*85/100;cw=ch*16/9;
-        if(cw+extraW>workW*95/100){cw=(workW-extraW)*95/100;ch=cw*9/16;}
+        ch=(workH-extraH)*85/100;cw=wideGame?ch*16/9:ch*4/3;   // 4:3 when Widescreen is off
+        if(cw+extraW>workW*95/100){cw=(workW-extraW)*95/100;ch=wideGame?cw*9/16:cw*3/4;}
     }
     int w=cw+extraW,h=ch+extraH;
     int x=info.rcWork.left+(workW-w)/2,y=info.rcWork.top+(workH-h)/2;
@@ -209,6 +217,7 @@ void toggleFullscreen(HWND window) {
         borderlessFullscreen=false;
     }
     desiredFullscreen=borderlessFullscreen;
+    at<uint8_t>(0x5cd47a)=borderlessFullscreen?0:1;   // the game's own "windowed" flag (videos use the window or the screen)
     InvalidateRect(window,nullptr,FALSE);logWindow(window);
 }
 // Alt+F4 always closes the game (not an option): ask the window to close, and end the process if the
@@ -218,6 +227,42 @@ void closeGame(HWND window) {
     static bool armed=false;
     PostMessageW(window,WM_CLOSE,0,0);
     if(!armed){armed=true;HANDLE h=CreateThread(nullptr,0,forceExitThread,nullptr,0,nullptr);if(h)CloseHandle(h);}
+}
+// Hotkeys (Alt+Enter / F11 fullscreen, Alt+F4 close). They normally arrive as window messages, but when the keyboard
+// focus sits on another window of the game (or the messages are taken elsewhere) they never reach the game window, so a
+// small helper also watches the keys themselves while the game is the foreground application. Both routes end in
+// hotkeyAction, which ignores a repeat within 300 ms, so a key that arrives twice acts once.
+void status(const char* message);
+constexpr UINT WM_RRHD_HOTKEY=WM_APP+0x52;   // wParam: 1 = fullscreen toggle, 2 = close
+void hotkeyAction(HWND window,int what,const char* route) {
+    static DWORD last[4]{};static bool logged[2][4]{};
+    DWORD now=GetTickCount();
+    if(what<1 || what>3 || now-last[what]<300)return;
+    last[what]=now;
+    bool pollRoute=route[0]=='p';
+    if(!logged[pollRoute][what]){logged[pollRoute][what]=true;char m[100];std::snprintf(m,sizeof m,"hotkey %s via %s",what==1?"fullscreen":what==3?"HUD":"close",pollRoute?"key polling (the window did not get the key message)":"window message");status(m);}
+    if(what==1){if(windowAltEnter)toggleFullscreen(window);}
+    else if(what==3){hudHidden=!hudHidden;status(hudHidden?"HUD hidden (F10)":"HUD shown (F10)");}
+    else closeGame(window);
+}
+DWORD WINAPI hotkeyThread(LPVOID) {
+    bool wasReturn=false,wasF11=false,wasF4=false,wasF10=false;
+    for(;;) {
+        Sleep(15);
+        HWND foreground=GetForegroundWindow();DWORD process=0;
+        if(foreground)GetWindowThreadProcessId(foreground,&process);
+        HWND target=hookedWindow;
+        bool mine=target && process==GetCurrentProcessId();
+        bool alt=(GetAsyncKeyState(VK_MENU)&0x8000)!=0;
+        bool ret=mine && alt && (GetAsyncKeyState(VK_RETURN)&0x8000)!=0,f11=mine && (GetAsyncKeyState(VK_F11)&0x8000)!=0,f4=mine && alt && (GetAsyncKeyState(VK_F4)&0x8000)!=0;
+        if(ret && !wasReturn)PostMessageW(target,WM_RRHD_HOTKEY,1,0);
+        if(f11 && !wasF11)PostMessageW(target,WM_RRHD_HOTKEY,1,0);
+        if(f4 && !wasF4)PostMessageW(target,WM_RRHD_HOTKEY,2,0);
+        bool f10=mine && hudToggleKey && (GetAsyncKeyState(VK_F10)&0x8000)!=0;
+        if(f10 && !wasF10)PostMessageW(target,WM_RRHD_HOTKEY,3,0);
+        wasReturn=ret;wasF11=f11;wasF4=f4;wasF10=f10;
+    }
+    return 0;
 }
 // Auto-hide the mouse cursor: hidden from the start, shown as soon as the mouse moves or a button is pressed,
 // hidden again after a few seconds without mouse movement.
@@ -295,15 +340,50 @@ void themeThread() {
 }
 using OpenFileFn=BOOL(WINAPI*)(LPOPENFILENAMEA);
 OpenFileFn originalOpenFile=nullptr,originalSaveFile=nullptr;
-BOOL WINAPI getOpenFileNameHook(LPOPENFILENAMEA ofn){StyleScope scope;return originalOpenFile(ofn);}
-BOOL WINAPI getSaveFileNameHook(LPOPENFILENAMEA ofn){StyleScope scope;return originalSaveFile(ofn);}
+// Load Game remembers the save that was used last: the dialog opens with that file already selected. The name is kept in
+// RoadRashHD.ini ([Game] LastSave) after every successful Open or Save as. While a file dialog is open the controller
+// works it (see padDialogThread): D-pad up / down move through the files, A opens, B cancels.
+void rememberedSaveFill(LPOPENFILENAMEA ofn) {
+    if(!rememberLastSave || !ofn || !ofn->lpstrFile || ofn->nMaxFile<16 || ofn->lpstrFile[0])return;   // the game gave its own name: keep it
+    wchar_t last[MAX_PATH]{};
+    GetPrivateProfileStringW(L"Game",L"LastSave",L"",last,MAX_PATH,configPath.c_str());
+    if(!last[0] || GetFileAttributesW(last)==INVALID_FILE_ATTRIBUTES)return;
+    char ansi[MAX_PATH*2]{};
+    int n=WideCharToMultiByte(CP_ACP,0,last,-1,ansi,sizeof ansi,nullptr,nullptr);
+    if(n<=0 || DWORD(n)>ofn->nMaxFile)return;
+    std::memcpy(ofn->lpstrFile,ansi,size_t(n));
+}
+void rememberChosenSave(LPOPENFILENAMEA ofn) {
+    if(!rememberLastSave || !ofn || !ofn->lpstrFile || !ofn->lpstrFile[0])return;
+    wchar_t chosen[MAX_PATH]{};
+    if(MultiByteToWideChar(CP_ACP,0,ofn->lpstrFile,-1,chosen,MAX_PATH)<=0)return;
+    wchar_t full[MAX_PATH]{};
+    if(GetFullPathNameW(chosen,MAX_PATH,full,nullptr)>0)WritePrivateProfileStringW(L"Game",L"LastSave",full,configPath.c_str());
+}
+BOOL controlledFileDialog(OpenFileFn function,LPOPENFILENAMEA ofn,bool load) {
+    StyleScope scope;
+    if(load)rememberedSaveFill(ofn);
+    PadDialogState state{GetCurrentThreadId(),0,true};HANDLE thread=nullptr;
+    if(padDialogs){InterlockedIncrement(&padBlock);thread=CreateThread(nullptr,0,padDialogThread,&state,0,nullptr);}
+    BOOL result=function(ofn);
+    if(padDialogs){InterlockedExchange(&state.done,1);if(thread){WaitForSingleObject(thread,1000);CloseHandle(thread);}InterlockedDecrement(&padBlock);}
+    if(result)rememberChosenSave(ofn);
+    return result;
+}
+BOOL WINAPI getOpenFileNameHook(LPOPENFILENAMEA ofn){return controlledFileDialog(originalOpenFile,ofn,true);}
+BOOL WINAPI getSaveFileNameHook(LPOPENFILENAMEA ofn){return controlledFileDialog(originalSaveFile,ofn,false);}
 // Alt+F4 is also caught where the game dispatches its messages, so it closes the game whichever of its windows has the focus.
 using DispatchMessageFn=LRESULT(WINAPI*)(const MSG*);
 DispatchMessageFn originalDispatchMessage=nullptr;
 LRESULT WINAPI dispatchMessageHook(const MSG* message) {
+    if(message && message->message==WM_RRHD_HOTKEY) {hotkeyAction(message->hwnd,int(message->wParam),"poll");return 0;}
+    if(message && hudToggleKey && (message->message==WM_SYSKEYDOWN || message->message==WM_SYSKEYUP) && message->wParam==VK_F10)return 0;   // F10 would activate the window menu
     if(message && message->message==WM_SYSKEYDOWN && message->wParam==VK_F4 && (message->lParam&(1<<29))) {
         HWND target=hookedWindow?hookedWindow:GetAncestor(message->hwnd,GA_ROOTOWNER);
-        if(target){closeGame(target);return 0;}
+        if(target){hotkeyAction(target,2,"message");return 0;}
+    }
+    if(message && windowAltEnter && ((message->message==WM_SYSKEYDOWN && message->wParam==VK_RETURN && (message->lParam&(1<<29))) || (message->message==WM_KEYDOWN && message->wParam==VK_F11))) {
+        if(!(message->lParam&(1<<30)) && hookedWindow){hotkeyAction(hookedWindow,1,"message");return 0;}
     }
     return originalDispatchMessage(message);
 }
@@ -332,11 +412,12 @@ LRESULT CALLBACK renderWindowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) 
             break;
         }
     }
-    if(message==WM_SYSKEYDOWN && wp==VK_F4 && (lp&(1<<29))){closeGame(window);return 0;}
+    if(message==WM_RRHD_HOTKEY){hotkeyAction(window,int(wp),"poll");return 0;}
+    if(message==WM_SYSKEYDOWN && wp==VK_F4 && (lp&(1<<29))){hotkeyAction(window,2,"message");return 0;}
     if(windowAltEnter) {
         // Alt+Enter (and F11) switch between the window and borderless fullscreen.
         if((message==WM_SYSKEYDOWN && wp==VK_RETURN && (lp&(1<<29))) || (message==WM_KEYDOWN && wp==VK_F11)) {
-            if(!(lp&(1<<30)))toggleFullscreen(window); // ignore auto-repeat
+            if(!(lp&(1<<30)))hotkeyAction(window,1,"message"); // ignore auto-repeat
             return 0;
         }
         if(message==WM_SYSCHAR && wp==VK_RETURN)return 0; // no system beep
@@ -350,6 +431,7 @@ LRESULT CALLBACK renderWindowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) 
 void logWindow(HWND window);
 void hookWindow(HWND window) {
     themeThread();
+    {static bool started=false;if(!started && window){started=true;HANDLE h=CreateThread(nullptr,0,hotkeyThread,nullptr,0,nullptr);if(h)CloseHandle(h);}}
     if(!window || hookedWindow==window)return;
     auto previous=reinterpret_cast<WNDPROC>(SetWindowLongPtrA(window,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(&renderWindowProc)));
     if(previous){hookedWindow=window;previousWindowProc=previous;}
@@ -378,6 +460,7 @@ void hookWindow(HWND window) {
                 else borderlessFullscreen=true;
             }
             desiredFullscreen=borderlessFullscreen||desiredFullscreen;
+            at<uint8_t>(0x5cd47a)=(GetWindowLongA(window,GWL_STYLE)&WS_CAPTION)?1:0;
         }
     }
     {
@@ -472,7 +555,7 @@ void status(const char* message) {
 // seconds: average time per stage and the distribution of presented-frame
 // intervals, which is what a viewer perceives as stutter.
 bool profileEnabled=false;
-bool gpuFrame=false,fixPostcards=true,fixBikeColors=true;
+bool gpuFrame=false,fixPostcards=true,fixBikeColors=true,keyboardAndPad=true,keyboardAndPadActive=false;
 int videoVolume=100;   // [Game] VideoVolume, percent
 bool asyncControllerScan=true,fixTextEncoding=true,skipIntro=false,fullRateObjects=true;
 int dumpEverySeconds=0,dumpScale=2;
@@ -661,8 +744,14 @@ bool hookImport(uintptr_t va,const wchar_t* module,const char* name,void* hook,v
 // Physical client dimensions, without an aspect whitelist or fixed row table.
 void viewport(int cw,int ch) {
     clientWidth=cw;clientHeight=ch;
-    int h=renderHeight>0?renderHeight:ch;
-    int w=renderHeight>0?std::max(1,int(std::lround(double(cw)*h/ch))):cw;
+    int bw=cw,bh=ch,bx=0,by=0;
+    if(!wideGame) {   // original 4:3 picture: the largest 4:3 box that fits, centred
+        if(cw*3>ch*4){bw=std::max(1,ch*4/3);bx=(cw-bw)/2;}
+        else if(cw*3<ch*4){bh=std::max(1,cw*3/4);by=(ch-bh)/2;}
+    }
+    boxX=bx;boxY=by;boxW=bw;boxH=bh;
+    int h=renderHeight>0?renderHeight:bh;
+    int w=renderHeight>0?std::max(1,int(std::lround(double(bw)*h/bh))):bw;
     logicalWidth=(int(std::ceil(240.0*w/h))+1)&~1;
     sceneScale=h/480.0;sceneOffset=w/2.0-logicalWidth*sceneScale;
     if(w==width && h==height) return;
@@ -720,7 +809,24 @@ void startFrame() {
     frameActive=true;begun=false;worldReady=false;displayReady=false;gpuSceneReady=false;gpuFrame=false;
     primitives=0;batches=0;frameJobs.clear();textureSnapshots.clear();
 }
+// A profile that was set up for the keyboard has no pad codes in the game's assignment list (19 entries of one pad
+// code and one key code at 0x590e18; the game finds out which device is in use by looking for any pad code), so the
+// pad had nothing to press. Missing pad codes are filled in with the game's own defaults, and the list is used in
+// full (the pad-only D-pad entries are past the keyboard's 15). Codes the profile already has are never changed.
+void ensurePadAssignments() {
+    static const uint8_t defaults[19]={0x08,0x07,0x28,0x05,0x01,0x03,0x02,0x04,0x0c,0x26,0x06,0,0,0,0,0x25,0x27,0x28,0x26};
+    static bool logged=false;
+    bool changed=false;
+    for(int i=0;i<19;++i) {
+        uint8_t& code=at<uint8_t>(0x590e18+2*i);
+        if(code==0 && defaults[i]){code=defaults[i];changed=true;}
+    }
+    int& count=at<int>(0x5ce83c);
+    if(count>0 && count<19){count=19;changed=true;}
+    if(changed && !logged){logged=true;status("input: pad assignments added to a keyboard profile");}
+}
 int __cdecl frameHook() {
+    if(keyboardAndPadActive)ensurePadAssignments();
     if(!highMode() || !windowViewport()) { worldReady=false;displayReady=false;return fn<DrawList>(0x45ac50)(); }
     LARGE_INTEGER begin{},end{},frequency{};QueryPerformanceCounter(&begin);
     startFrame();int previous=at<int>(0x591c0c);
@@ -914,6 +1020,7 @@ void fillUiSpan(int y,int left,int right,uint32_t color) {
 uint8_t uiMask[480*640];uint32_t uiColorBuf[480*640];
 bool uiRowDirty[480];int uiRowMinX[480],uiRowMaxX[480];int uiDirtyMin=480,uiDirtyMax=-1;
 void uiSpan(int y,int left,int right,uint32_t color) {
+    if(hudHidden)return;
     if(!(gpu.ready() && gpuRequested)){fillUiSpan(y,left,right,color);return;}
     for(int x=left;x<right;++x){uiMask[y*640+x]=1;uiColorBuf[y*640+x]=color;}
     if(!uiRowDirty[y]){uiRowDirty[y]=true;uiRowMinX[y]=left;uiRowMaxX[y]=right;}
@@ -1242,6 +1349,7 @@ bool gpuPresent() {
         gpu.drawUi(info,layer.data(),!smoothUi);   // flat (nearest) unless [Graphics] SmoothText=1
         clearUiMask();
     }
+    gpu.boxX=boxX;gpu.boxY=boxY;gpu.boxW=boxW;gpu.boxH=boxH;
     bool ok=gpu.present(gpuVSync);
     if(autoQuality && autoT0.QuadPart) {
         LARGE_INTEGER t1,f;QueryPerformanceCounter(&t1);QueryPerformanceFrequency(&f);
@@ -1268,7 +1376,11 @@ int WINAPI stretchHook(HDC dc,int x,int y,int w,int h,int sx,int sy,int sw,int s
         info.bmiHeader.biWidth=width;info.bmiHeader.biHeight=-height;
         info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
         LONGLONG t0=profileEnabled?profiler.now():0;
-        int rows=originalStretch(dc,0,0,clientWidth,clientHeight,0,0,width,height,rgba.data(),&info,DIB_RGB_COLORS,rop);
+        if(boxW!=clientWidth || boxH!=clientHeight) {   // black bars around the 4:3 picture
+            if(boxX>0){PatBlt(dc,0,0,boxX,clientHeight,BLACKNESS);PatBlt(dc,boxX+boxW,0,clientWidth-boxX-boxW,clientHeight,BLACKNESS);}
+            if(boxY>0){PatBlt(dc,0,0,clientWidth,boxY,BLACKNESS);PatBlt(dc,0,boxY+boxH,clientWidth,clientHeight-boxY-boxH,BLACKNESS);}
+        }
+        int rows=originalStretch(dc,boxX,boxY,boxW,boxH,0,0,width,height,rgba.data(),&info,DIB_RGB_COLORS,rop);
         if(profileEnabled){LONGLONG end=profiler.now();profiler.stage[StagePresent]+=end-t0;profiler.lastStretch=end-t0;
             profiler.maxStretch=std::max(profiler.maxStretch,end-t0);profiler.presented(end);dumpFrame(end);}
         if(rows>0)completedFrame=true;
@@ -1510,7 +1622,6 @@ DWORD WINAPI hidScanThread(LPVOID) {
 // (or left stick) moves between the buttons, A presses the focused button, B answers "Cancel" / "No". A control
 // already held when the box opens is ignored until it has been released, so the press that opened the box does
 // not answer it.
-bool padDialogs=true;
 // The message box is the visible, ENABLED dialog of the game thread: while it is open the dialog it belongs to
 // (the game's own profile / save dialogs are #32770 windows of the same thread) is disabled.
 BOOL CALLBACK findDialog(HWND window,LPARAM lp) {
@@ -1545,6 +1656,33 @@ DWORD WINAPI padDialogThread(LPVOID context) {
         GUITHREADINFO info{};info.cbSize=sizeof info;
         char name[16]{};HWND focus=nullptr;
         if(GetGUIThreadInfo(state->thread,&info) && info.hwndFocus && IsChild(dialog,info.hwndFocus)){focus=info.hwndFocus;GetClassNameA(focus,name,sizeof name);}
+        // Race Resolution dialog (list 1002, text 1001): the D-pad changes the selection directly, A applies, B cancels.
+        if(GetDlgItem(dialog,1002) && GetDlgItem(dialog,1001)) {
+            if(fresh&(0x0001|0x0002|0x0004|0x0008)) {
+                HWND combo=GetDlgItem(dialog,1002);
+                LRESULT count=SendMessageA(combo,CB_GETCOUNT,0,0),current=SendMessageA(combo,CB_GETCURSEL,0,0);
+                if(count>0) {
+                    bool previous=(fresh&(0x0001|0x0004))!=0;
+                    LRESULT next=current<0?0:(previous?std::max<LRESULT>(0,current-1):std::min<LRESULT>(count-1,current+1));
+                    SendMessageA(combo,CB_SETCURSEL,WPARAM(next),0);
+                }
+                continue;
+            }
+            if(fresh&0x1000){pressDialogButton(dialog,IDOK);continue;}
+            if(fresh&0x2000){pressDialogButton(dialog,IDCANCEL);continue;}
+        }
+        // Open / Save as: D-pad up / down move through the file list (its ListBox is control 0x460, or the list view of an
+        // Explorer-style dialog), whatever has the focus; A opens, B cancels (below).
+        if(fresh&(0x0001|0x0002)) {
+            HWND fileList=GetDlgItem(dialog,0x0460);
+            if(!fileList){struct Find{static BOOL CALLBACK each(HWND w,LPARAM lp){char c[24]{};GetClassNameA(w,c,sizeof c);if(_stricmp(c,"SysListView32")==0){*reinterpret_cast<HWND*>(lp)=w;return FALSE;}return TRUE;}};
+                EnumChildWindows(dialog,Find::each,reinterpret_cast<LPARAM>(&fileList));}
+            if(fileList && IsWindowVisible(fileList)) {
+                WPARAM key=(fresh&0x0001)?VK_UP:VK_DOWN;
+                PostMessageA(fileList,WM_KEYDOWN,key,0);PostMessageA(fileList,WM_KEYUP,key,0);
+                continue;
+            }
+        }
         bool pickList=focus && (_stricmp(name,"ComboBox")==0 || _stricmp(name,"ListBox")==0);   // up / down change the selection
         if(pickList && (fresh&(0x0001|0x0002))) {
             WPARAM key=(fresh&0x0001)?VK_UP:VK_DOWN;
@@ -1553,7 +1691,9 @@ DWORD WINAPI padDialogThread(LPVOID context) {
         else if(fresh&(0x0004|0x0001))PostMessageA(dialog,WM_NEXTDLGCTL,1,FALSE);   // previous control
         else if(fresh&(0x0008|0x0002))PostMessageA(dialog,WM_NEXTDLGCTL,0,FALSE);   // next control
         else if(fresh&0x1000) {
-            if(focus && _stricmp(name,"Button")==0)PostMessageA(focus,BM_CLICK,0,0);
+            // "The file already exists. Replace it?" of Save as: A answers Yes, whatever button has the focus (it starts on No).
+            if(state->files && GetDlgItem(dialog,IDYES) && GetDlgItem(dialog,IDNO))pressDialogButton(dialog,IDYES);
+            else if(focus && _stricmp(name,"Button")==0)PostMessageA(focus,BM_CLICK,0,0);
             else pressDialogButton(dialog,GetDlgItem(dialog,IDYES)?IDYES:IDOK);   // a list is focused: confirm the dialog
         } else if(fresh&0x2000)
             pressDialogButton(dialog,GetDlgItem(dialog,IDCANCEL)?IDCANCEL:GetDlgItem(dialog,IDNO)?IDNO:IDOK);
@@ -1688,6 +1828,35 @@ bool initialize(HMODULE module) {
         if(match){for(auto s:sites)ok=branch(s,reinterpret_cast<void*>(&skipIntroVideo),0xe8)&&ok;}
         else status("skip intro ignored: unexpected start-up code");
     }
+    if(keyboardAndPad) {
+        // The game polls the keyboard and the pad in one routine (0x46bf40). Both loops walk the same list of
+        // assignments (one key code and one pad code each); which of them runs depends on the control device saved in
+        // the profile: a jump at 0x46bf5f skips the keyboard when the pad is selected, a jump at 0x46c028 skips the pad
+        // when the keyboard is selected. Removing both jumps makes the keyboard and the pad work together (the pad part
+        // stays harmless without a pad: its read fails and the routine returns). Each jump is verified with the compare
+        // in front of it.
+        // (The compares hold absolute addresses, which the loader rebases, so those are checked relative to the image base.)
+        const uint8_t keyboardJump[6]={0x0f,0x85,0x8c,0x00,0x00,0x00},padJump[6]={0x0f,0x84,0x04,0x02,0x00,0x00};
+        auto compareMatches=[&](uintptr_t va,uintptr_t variable)->bool {
+            return at<uint8_t>(va)==0x80 && at<uint8_t>(va+1)==0x3d && at<uint32_t>(va+2)==uint32_t(base+variable-0x400000) && at<uint8_t>(va+6)==0x00;
+        };
+        bool match=compareMatches(0x46bf57,0x618480) && compareMatches(0x46c01b,0x5a43d8);
+        for(int i=0;i<6;++i)match=match && at<uint8_t>(0x46bf5f+i)==keyboardJump[i] && at<uint8_t>(0x46c028+i)==padJump[i];
+        if(match) {
+            const uint8_t nops[6]={0x90,0x90,0x90,0x90,0x90,0x90};
+            ok=writeMemory(base+0x46bf5f-0x400000,nops,6)&&ok;
+            ok=writeMemory(base+0x46c028-0x400000,nops,6)&&ok;
+            keyboardAndPadActive=true;
+            status("input: keyboard and pad work together");
+        }
+        else {
+            char message[200];
+            std::snprintf(message,sizeof message,"keyboard and pad together ignored: unexpected input code (at 0x46bf57: %02x %02x %02x%02x%02x%02x %02x %02x %02x; at 0x46c01b: %02x %02x %02x%02x%02x%02x %02x %02x %02x)",
+                at<uint8_t>(0x46bf57),at<uint8_t>(0x46bf58),at<uint8_t>(0x46bf59),at<uint8_t>(0x46bf5a),at<uint8_t>(0x46bf5b),at<uint8_t>(0x46bf5c),at<uint8_t>(0x46bf5d),at<uint8_t>(0x46bf5e),at<uint8_t>(0x46bf5f),
+                at<uint8_t>(0x46c01b),at<uint8_t>(0x46c01c),at<uint8_t>(0x46c01d),at<uint8_t>(0x46c01e),at<uint8_t>(0x46c01f),at<uint8_t>(0x46c020),at<uint8_t>(0x46c021),at<uint8_t>(0x46c022),at<uint8_t>(0x46c023));
+            status(message);
+        }
+    }
     if(fixBikeColors) {
         // The in-race bikes are drawn from one template and recoloured with one 256-byte palette remap per bike
         // (15 tables at 0x596a90, indexed by the bike's spec number: 0-4 Rat, 5-9 Super, 10-14 Sport). The Rat and
@@ -1753,12 +1922,13 @@ bool initialize(HMODULE module) {
     Stretch hook=&stretchHook;ok=writeMemory(base+0x21c15c,&hook,sizeof hook)&&ok;
     Fill fill=&fillHook;ok=writeMemory(base+0x21c728,&fill,sizeof fill)&&ok;
     ok=branch(0x45b3c0,reinterpret_cast<void*>(&resolutionMenuHook),0xe9)&&ok;
-    status(ok?(std::string(RRHD_NAME " v" RRHD_VERSION " (renderer v5): animation null-metadata fix, subpixel geometry, textured menu extension and native raster")).c_str():"hook installation failed");return ok;
+    status(ok?(std::string(RRHD_NAME " v" RRHD_VERSION RRHD_BUILD_SUFFIX " (renderer v5): animation null-metadata fix, subpixel geometry, textured menu extension and native raster")).c_str():"hook installation failed");return ok;
 }
 }
 
 // Read by the installer/launcher (it scans the file for this tag) to tell which MultiFix version is in the game folder.
 extern "C" __declspec(dllexport) const char RRHD_VersionTag[]="RRHD_VERSION_TAG:" RRHD_VERSION;
+extern "C" __declspec(dllexport) const char RRHD_BuildTag[]="RRHD_BUILD_TAG:" RRHD_BUILD_STAMP;
 
 // [Performance] HighPerformance=1: ask Windows to treat the game as a foreground, full-speed workload.
 //  * EcoQoS / execution-speed throttling off (hybrid laptops and Windows 11 otherwise may clock the process down),
@@ -1844,6 +2014,10 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     skipIntro=GetPrivateProfileIntW(L"Game",L"SkipIntro",0,configPath.c_str())!=0;
     fixPostcards=GetPrivateProfileIntW(L"Game",L"FixPostcards",1,configPath.c_str())!=0;
     fixBikeColors=GetPrivateProfileIntW(L"Game",L"FixBikeColors",1,configPath.c_str())!=0;
+    keyboardAndPad=GetPrivateProfileIntW(L"Input",L"KeyboardAndPad",1,configPath.c_str())!=0;
+    hudToggleKey=GetPrivateProfileIntW(L"Input",L"HudToggleKey",1,configPath.c_str())!=0;
+    hudHidden=GetPrivateProfileIntW(L"Graphics",L"HideHud",0,configPath.c_str())!=0;
+    rememberLastSave=GetPrivateProfileIntW(L"Game",L"RememberLastSave",1,configPath.c_str())!=0;
     videoVolume=int(GetPrivateProfileIntW(L"Game",L"VideoVolume",100,configPath.c_str()));
     if(videoVolume<0)videoVolume=0;if(videoVolume>100)videoVolume=100;
     fullRateObjects=GetPrivateProfileIntW(L"Game",L"FullRateObjects",1,configPath.c_str())!=0;
@@ -1854,6 +2028,6 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     startFullscreen=GetPrivateProfileIntW(L"Window",L"StartFullscreen",1,configPath.c_str())!=0;
     windowWidth=GetPrivateProfileIntW(L"Window",L"Width",0,configPath.c_str());
     windowHeight=GetPrivateProfileIntW(L"Window",L"Height",0,configPath.c_str());
-    if(!GetPrivateProfileIntW(L"Window",L"WideWindow",1,configPath.c_str()))windowWidth=windowHeight=-1;
+    if(!GetPrivateProfileIntW(L"Window",L"WideWindow",1,configPath.c_str())){windowWidth=windowHeight=-1;wideGame=false;}
     if(enabled)initialize(module);
 }

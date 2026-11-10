@@ -36,12 +36,14 @@ internal sealed class PatchOption
 
 internal static class Installer
 {
-    public const string Title = ModInfo.Name + " " + ModInfo.Version;
+    public const string Title = ModInfo.Name + " " + ModInfo.Version + ModInfo.BuildSuffix;
     const string ExeName = "RoadRash95.exe", IniName = "RoadRashHD.ini";
-    const string BackupFolder = "ResolutionPatch_Backup";
+    // Earlier versions kept a backup folder with a state file; it is read once (to bring a saved original back) and removed.
+    const string LegacyBackupFolder = "ResolutionPatch_Backup";
+    // A different file that was in the way is kept next to the new one, e.g. ddraw.dll.multifix-backup.
+    const string BackupSuffix = ".multifix-backup";
     // Files this installer owns. Both are embedded in the installer.
     static readonly string[] Managed = { "ddraw.dll", "RoadRashMultiFix.dll" };
-    const string Magic = "RRHD_BACKUP_V2";
 
     // Executables the patch was verified with. Anything else is still allowed (the
     // renderer checks the game code itself and does nothing on a mismatch).
@@ -61,10 +63,11 @@ internal static class Installer
         new PatchOption("Graphics", "TextureFilter", true, "Texture Filtering (Direct3D Only)", "Bilinear filtering of the game's 3D environment (road, buildings, sky); never menus or text"),
         new PatchOption("Graphics", "VSync", false, "VSync", "Waits for the monitor refresh when presenting (off = lowest latency)"),
         new PatchOption("Performance", "HighPerformance", true, "High Performance Mode", "Turns off Windows power throttling for the game, 1 ms timer, slightly higher priority (helps integrated GPUs and laptops)"),
-        new PatchOption("Performance", "LowLatency", true, "Intel iGPU Battery Boost", "Turns off Low-Latency Presentation: faster on battery-powered Intel iGPUs", true),
-        new PatchOption("Window", "WideWindow", true, "Widescreen (16:9) Game", "Plays the whole game in widescreen (wide field of view) instead of the original 4:3"),
+        new PatchOption("Performance", "LowLatency", true, "iGPU Performance Boost", "Turns off Low-Latency Presentation: faster on battery-powered Intel iGPUs", true),
+        new PatchOption("Window", "WideWindow", true, "Widescreen Game", "Plays the whole game in widescreen (wide field of view); off = the original 4:3 picture with black bars"),
         new PatchOption("Window", "AltEnterFullscreen", true, "Alt+Enter / F11 Fullscreen Toggle", "Switches between the window and borderless fullscreen"),
         new PatchOption("Input", "SymmetricSteering", true, "Symmetric Analog Steering", "Controller stick turns right as gently as left (the game made right about twice as sensitive)"),
+        new PatchOption("Input", "KeyboardAndPad", true, "Keyboard + Controller Together", "Both work at the same time, whatever device the profile has selected"),
         new PatchOption("Input", "PadDialogs", true, "Controller Answers Dialogs", "A = OK / Yes and B = Cancel / No in the game's message boxes (for example when quitting)"),
         new PatchOption("Game", "FixBikeColors", true, "Fix Bike Colors", "The Rat and Super bikes have swapped colours in the race; they now match the showroom"),
         new PatchOption("Window", "AutoHideCursor", true, "Auto-Hide Mouse Cursor", "Hidden at start and after 3 s without mouse movement; returns when you move the mouse"),
@@ -82,23 +85,10 @@ internal static class Installer
 
     sealed class Game
     {
-        public string Root, Backup, StatePath;
-        public Game(string root)
-        {
-            Root = root; Backup = Path.Combine(root, BackupFolder); StatePath = Path.Combine(Backup, "state.txt");
-        }
-    }
-    sealed class State
-    {
-        // Hash of each managed file before installation ("-" = absent) and the
-        // hash this installer wrote.
-        public string[] Before = new string[Managed.Length], Installed = new string[Managed.Length];
-        public byte[] Bytes()
-        {
-            var lines = new List<string> { Magic };
-            lines.AddRange(Before); lines.AddRange(Installed);
-            return Encoding.UTF8.GetBytes(string.Join("\n", lines.ToArray()) + "\n");
-        }
+        public string Root;
+        public Game(string root) { Root = root; }
+        public string LegacyFolder { get { return Path.Combine(Root, LegacyBackupFolder); } }
+        public string BackupOf(int index) { return Path.Combine(Root, Managed[index] + BackupSuffix); }
     }
     sealed class Operation
     {
@@ -220,13 +210,13 @@ internal static class Installer
     public sealed class PatchStatus
     {
         public bool ProxyOurs, ProxyPresent, RendererPresent, RendererCurrent;
-        public string RendererVersion = "";
+        public string RendererVersion = "", RendererBuild = "";
         public bool Installed { get { return ProxyOurs && RendererPresent; } }
         public bool Outdated { get { return Installed && !RendererCurrent; } }
         public string Describe()
         {
             if (Installed)
-                return RendererCurrent ? "installed, DLL version " + RendererVersion + " (up to date)"
+                return RendererCurrent ? "installed, DLL version " + RendererVersion + (RendererBuild != "" ? " test " + RendererBuild : "") + " (up to date)"
                     : "installed, DLL version " + (RendererVersion != "" ? RendererVersion : "unknown") + " (this launcher has " + ModInfo.Version + " - press Install / Update)";
             if (ProxyPresent && !ProxyOurs) return "NOT installed - the game folder has a different ddraw.dll (another wrapper?); Install backs it up";
             if (ProxyOurs || RendererPresent) return "partially installed (a MultiFix file is missing) - press Install / Update";
@@ -241,12 +231,14 @@ internal static class Installer
         {
             string proxy = Path.Combine(folder, "ddraw.dll"), renderer = Path.Combine(folder, "RoadRashMultiFix.dll");
             s.ProxyPresent = File.Exists(proxy);
-            s.ProxyOurs = s.ProxyPresent && HashFile(proxy) == Hash(Resource("ddraw.dll"));
+            s.ProxyOurs = s.ProxyPresent && (HashFile(proxy) == Hash(Resource("ddraw.dll")) || IsOurProxy(File.ReadAllBytes(proxy)) || Directory.Exists(Path.Combine(folder, LegacyBackupFolder)));
             s.RendererPresent = File.Exists(renderer);
             if (s.RendererPresent)
             {
                 s.RendererCurrent = HashFile(renderer) == Hash(Resource("RoadRashMultiFix.dll"));
-                s.RendererVersion = TagVersion(File.ReadAllBytes(renderer));
+                byte[] rendererBytes = File.ReadAllBytes(renderer);
+                s.RendererVersion = TagVersion(rendererBytes);
+                s.RendererBuild = TagValue(rendererBytes, "RRHD_BUILD_TAG:");
                 if (s.RendererCurrent && s.RendererVersion == "") s.RendererVersion = ModInfo.Version;
             }
         }
@@ -254,9 +246,10 @@ internal static class Installer
         return s;
     }
     // The renderer DLL carries "RRHD_VERSION_TAG:<version>" followed by a NUL byte.
-    static string TagVersion(byte[] data)
+    static string TagVersion(byte[] data) { return TagValue(data, "RRHD_VERSION_TAG:"); }
+    static string TagValue(byte[] data, string prefix)
     {
-        byte[] tag = Encoding.ASCII.GetBytes("RRHD_VERSION_TAG:");
+        byte[] tag = Encoding.ASCII.GetBytes(prefix);
         for (int i = 0; i + tag.Length < data.Length; ++i)
         {
             int k = 0;
@@ -542,40 +535,21 @@ internal static class Installer
         }
         catch { Cleanup(temporary); throw; }
     }
-    static void Preserve(string path, byte[] bytes)
+    static bool Contains(byte[] data, string text)
     {
-        if (bytes == null) return;
-        if (File.Exists(path))
+        if (data == null) return false;
+        byte[] needle = Encoding.ASCII.GetBytes(text);
+        for (int i = 0; i + needle.Length <= data.Length; ++i)
         {
-            if (!Same(File.ReadAllBytes(path), bytes)) throw new IOException("An existing backup does not match the current file; the backup was not overwritten: " + path);
-            return;
+            int k = 0;
+            while (k < needle.Length && data[i + k] == needle[k]) ++k;
+            if (k == needle.Length) return true;
         }
-        string temporary = Stage(path, bytes);
-        try { File.Move(temporary, path); } finally { Cleanup(temporary); }
+        return false;
     }
-    static State ReadState(Game game)
-    {
-        if (!File.Exists(game.StatePath)) return null;
-        string[] lines = File.ReadAllLines(game.StatePath, Encoding.UTF8);
-        if (lines.Length != 1 + 2 * Managed.Length || lines[0] != Magic) throw new InvalidDataException("The backup record is corrupt.");
-        var state = new State();
-        for (int i = 0; i < Managed.Length; ++i)
-        {
-            state.Before[i] = lines[1 + i]; state.Installed[i] = lines[1 + Managed.Length + i];
-            if (Hash(Read(Path.Combine(game.Backup, Managed[i]))) != state.Before[i])
-                throw new InvalidDataException("Backup verification failed. No game files were changed.");
-        }
-        return state;
-    }
-    static void CheckCurrent(State state, byte[][] current)
-    {
-        for (int i = 0; i < Managed.Length; ++i)
-        {
-            string hash = Hash(current[i]);
-            if (hash != state.Before[i] && hash != state.Installed[i])
-                throw new InvalidOperationException(Managed[i] + " has been replaced by a different file since the patch was installed. The current file was not overwritten.");
-        }
-    }
+    // Our files carry a tag: the proxy "RRMF_PROXY_TAG", the renderer "RRHD_VERSION_TAG:".
+    static bool IsOurProxy(byte[] data) { return Contains(data, "RRMF_PROXY_TAG"); }
+    static bool IsOurRenderer(byte[] data) { return Contains(data, "RRHD_VERSION_TAG:"); }
     static void Add(List<Operation> operations, string path, byte[] after)
     {
         byte[] before = Read(path);
@@ -588,46 +562,50 @@ internal static class Installer
             throw new InvalidOperationException("RoadRash95.exe was not found in:\n" + game.Root + "\nChoose the game folder and try again.");
         var current = new byte[Managed.Length][];
         for (int i = 0; i < Managed.Length; ++i) current[i] = Read(Path.Combine(game.Root, Managed[i]));
-        State state = ReadState(game);
+        // An older install left a backup folder: its files were put there by this installer, and an original it saved is kept.
+        bool legacy = Directory.Exists(game.LegacyFolder);
+        var legacyOriginal = new byte[Managed.Length][];
+        if (legacy) for (int i = 0; i < Managed.Length; ++i) legacyOriginal[i] = Read(Path.Combine(game.LegacyFolder, Managed[i]));
+        var ours = new bool[Managed.Length];
+        ours[0] = current[0] != null && (legacy || IsOurProxy(current[0]));
+        ours[1] = current[1] != null && (legacy || IsOurRenderer(current[1]));
         var operations = new List<Operation>();
         if (restore)
         {
-            if (state == null) throw new InvalidOperationException("There is no backup made by this installer. No game files were changed.");
-            CheckCurrent(state, current);
-            // ddraw.dll first: once it is gone the game no longer references the renderer.
-            for (int i = 0; i < Managed.Length; ++i)
-                Add(operations, Path.Combine(game.Root, Managed[i]), Read(Path.Combine(game.Backup, Managed[i])));
+            for (int i = 0; i < Managed.Length; ++i)   // ddraw.dll first: once it is gone the game no longer references the renderer
+            {
+                string path = Path.Combine(game.Root, Managed[i]);
+                if (current[i] != null && !ours[i])
+                    throw new InvalidOperationException(Managed[i] + " has been replaced by a different file since the patch was installed. The current file was not overwritten.");
+                byte[] saved = Read(game.BackupOf(i)) ?? legacyOriginal[i];
+                if (current[i] != null) Add(operations, path, saved);
+                if (Read(game.BackupOf(i)) != null && current[i] != null) Add(operations, game.BackupOf(i), null);
+            }
             return operations;
         }
         var payload = new byte[Managed.Length][];
         for (int i = 0; i < Managed.Length; ++i) payload[i] = Resource(Managed[i]);
-        if (state == null)
+        for (int i = 0; i < Managed.Length; ++i)
         {
-            Directory.CreateDirectory(game.Backup);
-            state = new State();
-            for (int i = 0; i < Managed.Length; ++i)
-            {
-                string backup = Path.Combine(game.Backup, Managed[i]);
-                // A file that already equals ours needs no backup. Anything else is
-                // somebody's earlier file and is kept so Restore can bring it back.
-                byte[] before = Same(current[i], payload[i]) ? null : current[i];
-                // Reuse only identical leftovers from an interrupted attempt; never
-                // overwrite someone else's earlier backup.
-                if (before == null && File.Exists(backup))
-                    throw new IOException("The backup folder contains a different " + Managed[i] + ". The backup was not overwritten.");
-                Preserve(backup, before);
-                state.Before[i] = Hash(before);
-            }
+            // A file that is not ours (another wrapper) is somebody's earlier file: it is kept next to the new one.
+            byte[] keep = (current[i] != null && !ours[i] && !Same(current[i], payload[i])) ? current[i] : legacyOriginal[i];
+            if (keep == null) continue;
+            byte[] existing = Read(game.BackupOf(i));
+            if (existing != null && !Same(existing, keep))
+                throw new IOException("A different " + Managed[i] + BackupSuffix + " already exists. It was not overwritten and no game files were changed.");
+            if (existing == null) Add(operations, game.BackupOf(i), keep);
         }
-        else CheckCurrent(state, current);
-        for (int i = 0; i < Managed.Length; ++i) state.Installed[i] = Hash(payload[i]);
-        // The renderer is in place before ddraw.dll can reference it. Existing user
-        // settings are preserved, including during reinstallation.
+        // The renderer is in place before ddraw.dll can reference it. Existing user settings are preserved.
         for (int i = Managed.Length - 1; i >= 0; --i) Add(operations, Path.Combine(game.Root, Managed[i]), payload[i]);
         string ini = Path.Combine(game.Root, IniName);
         if (!File.Exists(ini)) Add(operations, ini, Resource(IniName));
-        Add(operations, game.StatePath, state.Bytes());
         return operations;
+    }
+    // The backup folder of earlier versions is not wanted any more.
+    static void RemoveLegacyFolder(Game game)
+    {
+        try { if (Directory.Exists(game.LegacyFolder)) Directory.Delete(game.LegacyFolder, true); }
+        catch (Exception) { }
     }
     static void SetFile(string path, string temporary, byte[] after)
     {
@@ -662,7 +640,7 @@ internal static class Installer
                 catch { failed.Add(op.Path); }
                 finally { Cleanup(temporary); }
             }
-            if (failed.Count > 0) throw new IOException("The operation failed. Restore these files manually from the backup folder:\n" + string.Join("\n", failed.ToArray()) + "\n" + error.Message);
+            if (failed.Count > 0) throw new IOException("The operation failed. Restore these files manually (the originals are the .multifix-backup files next to them):\n" + string.Join("\n", failed.ToArray()) + "\n" + error.Message);
             throw new IOException("The operation did not complete. Files replaced during this attempt were rolled back.\n" + error.Message, error);
         }
         finally { foreach (var op in operations) Cleanup(op.Temporary); }
@@ -690,6 +668,7 @@ internal static class Installer
             var operations = Prepare(game, restore);
             bool changed = operations.Count > 0;
             if (changed) Apply(operations);
+            RemoveLegacyFolder(game);
             // Earlier versions called the renderer RoadRashHD.dll; the proxy no longer loads it.
             try { string legacy = Path.Combine(game.Root, "RoadRashHD.dll"); if (File.Exists(legacy)) File.Delete(legacy); } catch (Exception) { }
             if (!restore) { MergeMissingIniKeys(game); WriteOptions(game, options ?? new Dictionary<string, bool>()); }

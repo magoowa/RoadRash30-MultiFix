@@ -90,6 +90,11 @@ internal static class WindowTest
                         if (c.Length != 1) throw new InvalidOperationException("Missing control " + name);
                         if (c[0].Left != edge) throw new InvalidOperationException(name + " must start at the common margin (" + edge + "), starts at " + c[0].Left);
                     }
+                    {   // the credits sit in the columns of the options: names under the option names, text under the descriptions
+                        var line = window.Controls.Find("VideoVolumeLine", true)[0]; 
+                        var info = window.Controls.Find("InstallPanel", true)[0];
+                        if (info.PointToScreen(Point.Empty).X != line.PointToScreen(Point.Empty).X) throw new InvalidOperationException("The installations block must start on the description column (" + info.PointToScreen(Point.Empty).X + " vs " + line.PointToScreen(Point.Empty).X + ")");
+                    }
                     var bar0 = window.Controls.Find("ButtonBar", true)[0]; var buttons0 = window.Controls.Find("PlayButton", true)[0].Parent;
                     if (buttons0.Left != bar0.Padding.Left || bar0.Padding.Left != edge) throw new InvalidOperationException("The buttons must use the same margin as the content (buttons " + buttons0.Left + ", bar padding " + bar0.Padding.Left + ", content " + edge + ")");
                     var logoBox = window.Controls.Find("LogoBox", true);

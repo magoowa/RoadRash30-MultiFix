@@ -29,25 +29,51 @@ def mod_version():
     return re.search(r'RRHD_VERSION\s+"([^"]+)"', (ROOT / 'src/hd_version.hpp').read_text()).group(1)
 
 
+def version_resource(path, original_name, description):
+    """Writes a VERSIONINFO resource script: what Explorer shows in the file's Details tab."""
+    v = mod_version()
+    parts = (v.split('.') + ['0', '0', '0', '0'])[:4]
+    numeric = ','.join(parts)
+    fields = [('CompanyName', 'magoowa (based on OBLPlife RoadRash30th-HD)'),
+              ('FileDescription', description),
+              ('FileVersion', v),
+              ('InternalName', original_name),
+              ('LegalCopyright', 'PolyForm Noncommercial License 1.0.0. magoowa; based on OBLPlife RoadRash30th-HD'),
+              ('OriginalFilename', original_name),
+              ('ProductName', 'RoadRash30-MultiFix'),
+              ('ProductVersion', v),
+              ('Comments', 'Fixes, widescreen and a Direct3D 11 renderer for Road Rash: 30th Anniversary Edition. https://github.com/magoowa/RoadRash30-MultiFix')]
+    body = ''.join('            VALUE "%s", "%s\\0"\n' % (k, x) for k, x in fields)
+    text = ('#pragma code_page(65001)\n#include <windows.h>\n'
+            'VS_VERSION_INFO VERSIONINFO\n FILEVERSION %s\n PRODUCTVERSION %s\n FILEFLAGSMASK 0x3fL\n FILEFLAGS 0x0L\n FILEOS VOS_NT_WINDOWS32\n FILETYPE VFT_DLL\n FILESUBTYPE 0x0L\n'
+            'BEGIN\n    BLOCK "StringFileInfo"\n    BEGIN\n        BLOCK "040904b0"\n        BEGIN\n%s        END\n    END\n'
+            '    BLOCK "VarFileInfo"\n    BEGIN\n        VALUE "Translation", 0x409, 1200\n    END\nEND\n') % (numeric, numeric, body)
+    Path(path).write_text(text, encoding='utf-8')
+
+
 def build(vcvarsall, tests):
     work = ROOT / 'build'
     work.mkdir(exist_ok=True)
     version = mod_version()
     (work / 'Version.cs').write_text('internal static class ModInfo { public const string Version = "%s"; public const string Name = "RoadRash30-MultiFix"; }\n' % version, encoding='utf-8')
     (ROOT / 'dist').mkdir(exist_ok=True)
+    version_resource(work / 'renderer_version.rc', 'RoadRashMultiFix.dll', 'RoadRash30-MultiFix renderer and game fixes')
+    version_resource(work / 'ddraw_version.rc', 'ddraw.dll', 'RoadRash30-MultiFix loader (ddraw.dll proxy that loads RoadRashMultiFix.dll)')
     commands = ['@echo off', 'chcp 65001 >nul', f'call "{compiler_environment(vcvarsall)}" x86 >nul', 'if errorlevel 1 exit /b 1',
                 'cd /d "%~dp0.."',
                 'rc /nologo /fo build\\hd_menu.res src\\hd_menu.rc', 'if errorlevel 1 exit /b 1',
+                'rc /nologo /fo build\\renderer_version.res build\\renderer_version.rc', 'if errorlevel 1 exit /b 1',
+                'rc /nologo /fo build\\ddraw_version.res build\\ddraw_version.rc', 'if errorlevel 1 exit /b 1',
                 # Shaders are compiled here, not at run time (works under Wine/Proton, where d3dcompiler_47 may not cope).
                 'cl /nologo /std:c++17 /O2 /MT /EHsc /utf-8 tools\\compile_shaders.cpp /Fo:build\\compile_shaders.obj '
                 '/Fe:build\\compile_shaders.exe /link d3dcompiler.lib', 'if errorlevel 1 exit /b 1',
                 'build\\compile_shaders.exe build\\hd_shaders.inc', 'if errorlevel 1 exit /b 1',
                 'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /I build /LD src\\hd_renderer.cpp '
                 '/Fo:build\\hd_renderer.obj /Fe:build\\RoadRashMultiFix.dll /link /Brepro '
-                '/DEF:src\\hd_renderer.def build\\hd_menu.res user32.lib gdi32.lib advapi32.lib ole32.lib', 'if errorlevel 1 exit /b 1',
+                '/DEF:src\\hd_renderer.def build\\hd_menu.res build\\renderer_version.res user32.lib gdi32.lib advapi32.lib ole32.lib', 'if errorlevel 1 exit /b 1',
                 'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /LD src\\ddraw_proxy.cpp '
                 '/Fo:build\\ddraw_proxy.obj /Fe:build\\ddraw.dll /link /Brepro '
-                '/DEF:src\\ddraw_proxy.def user32.lib', 'if errorlevel 1 exit /b 1']
+                '/DEF:src\\ddraw_proxy.def build\\ddraw_version.res user32.lib', 'if errorlevel 1 exit /b 1']
     if tests:
         for name in ['hd_test', 'hd_loader_test', 'hd_perf_test', 'hd_animation_test', 'hd_gpu_test']:
             commands.extend([f'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /I build tests\\{name}.cpp '

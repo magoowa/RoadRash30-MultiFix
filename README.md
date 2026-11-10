@@ -27,9 +27,14 @@ Install copies `ddraw.dll`, `RoadRashMultiFix.dll` and (if missing) `RoadRashHD.
 
 The patch is a `ddraw.dll` proxy, so it can be loaded under Wine/Proton with a DLL override. **This is untested**; reports are welcome (please attach `RoadRashHD.log`).
 
-1. Download the release zip and use the `linux/` folder (it contains `install.sh`, `ddraw.dll`, `RoadRashMultiFix.dll` and `RoadRashHD.ini`).
-2. Run `./install.sh "/path/to/Road Rash 30th Anniversary Edition"` (the folder that contains `RoadRash95.exe`; for a Steam copy it is under `steamapps/common`). Add `--remove` to undo it.
-3. In Steam, set the launch option **`WINEDLLOVERRIDES="ddraw=n,b" %command%`** (outside Steam: `WINEDLLOVERRIDES="ddraw=n,b" wine RoadRash95.exe`).
+**The launch option in step 3 is required.** Dropping the files into the game folder is not enough: Proton only uses our `ddraw.dll` when told to, so without the launch option the game starts without MultiFix (and no `RoadRashHD.log` appears).
+
+1. Download the release zip and unpack it. The `linux/` folder holds `install.sh`, `ddraw.dll`, `RoadRashMultiFix.dll` and `RoadRashHD.ini`.
+2. Put the files into the game folder, the one that contains `RoadRash95.exe`. In Steam (Desktop mode): right-click the game, **Manage > Browse local files**. Either
+   - copy `ddraw.dll`, `RoadRashMultiFix.dll` and `RoadRashHD.ini` there by hand, or
+   - run the script from a terminal opened in the `linux` folder: `bash install.sh` (it finds the Steam copy, including one on the SD card, by itself) or `bash install.sh "/path/to/Road Rash 30th Anniversary Edition"`. Running it with `bash` needs no execute permission. `--remove` undoes it.
+3. In Steam open the game's **Properties > General > Launch Options** and paste **`WINEDLLOVERRIDES="ddraw=n,b" %command%`** (outside Steam: `WINEDLLOVERRIDES="ddraw=n,b" wine RoadRash95.exe`; Heroic and Lutris: add `WINEDLLOVERRIDES` = `ddraw=n,b` as an environment variable of the game).
+4. Start the game. `RoadRashHD.log` appears in the game folder; if it does not, the override was not applied.
 
 Notes: the Direct3D 11 renderer uses DXVK under Proton. Its shaders are compiled at build time, so no shader compiler is needed at run time. Under Wine the Direct3D surface is created on the game window itself (`[Graphics] ChildSurface=1` forces the Windows arrangement). If the picture is wrong, set `D3D11=0` in `RoadRashHD.ini` for the CPU renderer. `RoadRashHD.log` says "running under Wine ..." when Wine is detected.
 

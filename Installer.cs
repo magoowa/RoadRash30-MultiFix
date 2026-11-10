@@ -692,7 +692,7 @@ internal static class Installer
             if (changed) Apply(operations);
             // Earlier versions called the renderer RoadRashHD.dll; the proxy no longer loads it.
             try { string legacy = Path.Combine(game.Root, "RoadRashHD.dll"); if (File.Exists(legacy)) File.Delete(legacy); } catch (Exception) { }
-            if (!restore) WriteOptions(game, options ?? new Dictionary<string, bool>());
+            if (!restore) { MergeMissingIniKeys(game); WriteOptions(game, options ?? new Dictionary<string, bool>()); }
             if (!changed)
                 return Finish(game, restore ? "The game is already in its pre-install state." : "This version of MultiFix is already installed. Settings were updated.", false);
             return Finish(game, restore ? "ddraw.dll and RoadRashMultiFix.dll were removed (any earlier files were restored). RoadRashHD.ini was kept." :
@@ -705,6 +705,65 @@ internal static class Installer
                 message += "\nThe game folder is not writable. Run this patch as administrator (right-click, Run as administrator).";
             return Finish(game, message, true);
         }
+    }
+    // An older RoadRashHD.ini lacks the keys added later. They are added with the same explanatory comments as in the
+    // ini that ships with this version (a new ini is created from it), in the right section; nothing existing changes.
+    static void MergeMissingIniKeys(Game game)
+    {
+        try
+        {
+            string path = Path.Combine(game.Root, IniName);
+            if (!File.Exists(path)) return;
+            byte[] raw = File.ReadAllBytes(path);
+            if (raw.Length >= 2 && ((raw[0] == 0xFF && raw[1] == 0xFE) || (raw[0] == 0xFE && raw[1] == 0xFF))) return;   // UTF-16: leave it alone
+            Encoding encoding = Encoding.Default;
+            bool crlf = Encoding.ASCII.GetString(raw).Contains("\r\n");
+            var lines = new List<string>(encoding.GetString(raw).Replace("\r\n", "\n").Split('\n'));
+            if (lines.Count > 0 && lines[lines.Count - 1] == "") lines.RemoveAt(lines.Count - 1);
+            // the shipped ini: each key with the comment lines directly above it
+            string shipped = Encoding.UTF8.GetString(Resource(IniName)).Replace("\r\n", "\n");
+            string section = "";
+            var comments = new List<string>();
+            bool changed = false;
+            foreach (string line in shipped.Split('\n'))
+            {
+                string trimmed = line.Trim();
+                if (trimmed.Length == 0) { comments.Clear(); continue; }
+                if (trimmed.StartsWith(";")) { comments.Add(line); continue; }
+                if (trimmed.StartsWith("[") && trimmed.EndsWith("]")) { section = trimmed.Substring(1, trimmed.Length - 2); comments.Clear(); continue; }
+                int equals = trimmed.IndexOf('=');
+                if (equals <= 0 || section.Length == 0) { comments.Clear(); continue; }
+                string key = trimmed.Substring(0, equals).Trim();
+                // find the section and the key in the existing file
+                int sectionStart = -1, sectionEnd = lines.Count; bool found = false;
+                for (int i = 0; i < lines.Count; ++i)
+                {
+                    string current = lines[i].Trim();
+                    if (current.StartsWith("[") && current.EndsWith("]"))
+                    {
+                        if (sectionStart >= 0) { sectionEnd = i; break; }
+                        if (string.Equals(current.Substring(1, current.Length - 2).Trim(), section, StringComparison.OrdinalIgnoreCase)) sectionStart = i;
+                    }
+                    else if (sectionStart >= 0 && !current.StartsWith(";") && current.IndexOf('=') > 0 &&
+                             string.Equals(current.Substring(0, current.IndexOf('=')).Trim(), key, StringComparison.OrdinalIgnoreCase)) found = true;
+                }
+                if (!found)
+                {
+                    var add = new List<string>(comments); add.Add(line);
+                    if (sectionStart < 0) { lines.Add(""); lines.Add("[" + section + "]"); lines.AddRange(add); }
+                    else
+                    {
+                        int at = sectionEnd;   // after the last non-blank line of the section
+                        while (at > sectionStart + 1 && lines[at - 1].Trim().Length == 0) --at;
+                        lines.InsertRange(at, add);
+                    }
+                    changed = true;
+                }
+                comments.Clear();
+            }
+            if (changed) File.WriteAllText(path, string.Join(crlf ? "\r\n" : "\n", lines.ToArray()) + (crlf ? "\r\n" : "\n"), encoding);
+        }
+        catch (Exception) { }   // the options are still written key by key
     }
     static void WriteOptions(Game game, Dictionary<string, bool> options)
     {

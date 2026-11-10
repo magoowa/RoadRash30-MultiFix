@@ -45,7 +45,7 @@ def run(original_dir):
     def kept(ini):
         # The user's own values survive; keys missing from an older ini are added with defaults.
         text = ini.read_text(encoding='utf-8', errors='replace')
-        return 'RenderHeight=900' in text and '; preserve my settings' in text and 'TextureFilter=' in text
+        return 'RenderHeight=900' in text and '; preserve my settings' in text and 'TextureFilter=' in text and '; Smooth (bilinear) textures' in text
 
     def execute(game, *args, success=True):
         result = subprocess.run([str(game / 'HD_Resolution_Patch.exe'), '/quiet', '/path:' + str(game), *args], cwd=unrelated_cwd, timeout=30)

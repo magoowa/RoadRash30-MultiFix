@@ -297,6 +297,16 @@ using OpenFileFn=BOOL(WINAPI*)(LPOPENFILENAMEA);
 OpenFileFn originalOpenFile=nullptr,originalSaveFile=nullptr;
 BOOL WINAPI getOpenFileNameHook(LPOPENFILENAMEA ofn){StyleScope scope;return originalOpenFile(ofn);}
 BOOL WINAPI getSaveFileNameHook(LPOPENFILENAMEA ofn){StyleScope scope;return originalSaveFile(ofn);}
+// Alt+F4 is also caught where the game dispatches its messages, so it closes the game whichever of its windows has the focus.
+using DispatchMessageFn=LRESULT(WINAPI*)(const MSG*);
+DispatchMessageFn originalDispatchMessage=nullptr;
+LRESULT WINAPI dispatchMessageHook(const MSG* message) {
+    if(message && message->message==WM_SYSKEYDOWN && message->wParam==VK_F4 && (message->lParam&(1<<29))) {
+        HWND target=hookedWindow?hookedWindow:GetAncestor(message->hwnd,GA_ROOTOWNER);
+        if(target){closeGame(target);return 0;}
+    }
+    return originalDispatchMessage(message);
+}
 LRESULT CALLBACK renderWindowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
     if(autoHideCursor && cursorHidden && !IsWindowEnabled(window))showCursorAgain(window);
     if(autoHideCursor) {
@@ -1714,6 +1724,8 @@ bool initialize(HMODULE module) {
     {
         void* original=nullptr;   // window mode switch from the game menu, themed file dialogs
         if(hookImport(0x61c734,L"user32.dll","SetWindowPos",reinterpret_cast<void*>(&setWindowPosHook),&original))originalSetWindowPos=reinterpret_cast<SetWindowPosFn>(original);
+        original=nullptr;
+        if(hookImport(0x61c6e8,L"user32.dll","DispatchMessageA",reinterpret_cast<void*>(&dispatchMessageHook),&original))originalDispatchMessage=reinterpret_cast<DispatchMessageFn>(original);
         original=nullptr;
         if(hookImport(0x61c0b4,L"comdlg32.dll","GetOpenFileNameA",reinterpret_cast<void*>(&getOpenFileNameHook),&original))originalOpenFile=reinterpret_cast<OpenFileFn>(original);
         original=nullptr;

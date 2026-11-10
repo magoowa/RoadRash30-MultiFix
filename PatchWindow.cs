@@ -67,7 +67,7 @@ internal sealed class PatchWindow : Form
 
         // Top block: the logo on the left (a click opens the project page), installations and info on the right.
         var head = new TableLayoutPanel { Name = "HeadTable", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, m) };
-        head.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); head.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        head.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100F)); head.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));   // first column: as wide as the option names, so the info block starts on the description column
         try
         {
             using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("logo.png"))
@@ -153,6 +153,14 @@ internal sealed class PatchWindow : Form
         credits.Controls.Add(new Label { Name = "ContributionsLabel", Text = "Anakin94, peemosa, neparij", AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(0) }, 1, 1);
         footer.Controls.Add(credits, 1, 0);
         root.Controls.Add(footer);
+        // Only the info block at the top (installations, executable, MultiFix, language, netplay) is lined up: it starts on the
+        // column of the option descriptions, so the first column of the top block is as wide as the option names.
+        EventHandler alignHead = delegate
+        {
+            var widths = rows.GetColumnWidths();
+            if (widths.Length > 0 && (int)head.ColumnStyles[0].Width != widths[0]) head.ColumnStyles[0].Width = widths[0];
+        };
+        rows.SizeChanged += alignHead; rows.Layout += delegate { alignHead(null, EventArgs.Empty); };
 
         var buttons = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Dock = DockStyle.Fill };
         Button[] all = { play, install, restore, new Button { Name = "CloseButton", Text = "Close", DialogResult = DialogResult.Cancel } };
@@ -175,7 +183,12 @@ internal sealed class PatchWindow : Form
         scroll.BringToFront();      // the fill panel is laid out last
         // The mouse wheel scrolls the content.
         scroll.MouseEnter += delegate { if (ActiveForm == this && !(ActiveControl is TextBox) && !(ActiveControl is ComboBox)) scroll.Focus(); };
-        root.SizeChanged += delegate { scroll.AutoScrollMinSize = new Size(root.PreferredSize.Width, root.Height); };
+        // A horizontal scroll bar only when the window is really narrower than the content (not because a vertical bar took its width).
+        root.SizeChanged += delegate
+        {
+            int need = root.PreferredSize.Width + (scroll.VerticalScroll.Visible ? SystemInformation.VerticalScrollBarWidth : 0);
+            scroll.AutoScrollMinSize = new Size(ClientSize.Width >= need ? 0 : root.PreferredSize.Width, root.Height);
+        };
 
         var found = Installer.Detect();
         if (initialFolder != null)
@@ -267,8 +280,9 @@ internal sealed class PatchWindow : Form
     // Tests: pretend the working area is this rectangle.
     internal static Rectangle? WorkingAreaOverride;
     // As large as the content needs, but never larger than the screen's working area; scroll bars take over beyond that.
-    void FitToScreen(Control root, Control bar, ScrollableControl scroll)
+    void FitToScreen(Control root, Control bar, ScrollableControl scroll, bool recenter = true)
     {
+        fitRoot = root; fitBar = bar; fitScroll = scroll;
         Rectangle area = WorkingAreaOverride ?? Screen.FromPoint(Cursor.Position).WorkingArea;
         Size chrome = IsHandleCreated ? Size - ClientSize : SizeFromClientSize(Size.Empty);   // the real frame once the window exists
         root.PerformLayout();
@@ -284,10 +298,18 @@ internal sealed class PatchWindow : Form
         }
         scroll.AutoScrollMinSize = new Size(wanted.Width, wanted.Height);
         ClientSize = new Size(Math.Min(width, maxWidth), Math.Min(height, maxHeight));
-        Location = new Point(area.Left + Math.Max(0, (area.Width - Width) / 2), area.Top + Math.Max(0, (area.Height - Height) / 2));
+        if (recenter) Location = new Point(area.Left + Math.Max(0, (area.Width - Width) / 2), area.Top + Math.Max(0, (area.Height - Height) / 2));
+        else Location = new Point(Location.X, Math.Max(area.Top, Math.Min(Location.Y, area.Bottom - Height)));
     }
 
-    void Say(string text) { status.Text = text; status.Visible = true; }
+    // The status line appears below the options: grow the window by its height (once) so nothing needs a scroll bar.
+    void Say(string text)
+    {
+        bool first = !status.Visible;
+        status.Text = text; status.Visible = true;
+        if (first && IsHandleCreated && fitRoot != null) FitToScreen(fitRoot, fitBar, fitScroll, false);
+    }
+    Control fitRoot, fitBar; ScrollableControl fitScroll;
 
     void SetFolder(string folder)
     {

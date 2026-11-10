@@ -46,8 +46,6 @@ std::vector<uint32_t> gpuShot;
 uint32_t lastColors[256]{};
 HMODULE rendererModule;
 HWND hookedWindow;
-volatile bool hudHidden=false;   // F10: the text and HUD layer is left out
-bool hudToggleKey=true;           // [Input] HudToggleKey
 WNDPROC previousWindowProc;
 bool completedFrame=false;
 int renderHeight=0, width=0, height=0, clientWidth=0, clientHeight=0, logicalWidth=320;
@@ -235,18 +233,17 @@ void closeGame(HWND window) {
 void status(const char* message);
 constexpr UINT WM_RRHD_HOTKEY=WM_APP+0x52;   // wParam: 1 = fullscreen toggle, 2 = close
 void hotkeyAction(HWND window,int what,const char* route) {
-    static DWORD last[4]{};static bool logged[2][4]{};
+    static DWORD last[3]{};static bool logged[2][3]{};
     DWORD now=GetTickCount();
-    if(what<1 || what>3 || now-last[what]<300)return;
+    if(what<1 || what>2 || now-last[what]<300)return;
     last[what]=now;
     bool pollRoute=route[0]=='p';
-    if(!logged[pollRoute][what]){logged[pollRoute][what]=true;char m[100];std::snprintf(m,sizeof m,"hotkey %s via %s",what==1?"fullscreen":what==3?"HUD":"close",pollRoute?"key polling (the window did not get the key message)":"window message");status(m);}
+    if(!logged[pollRoute][what]){logged[pollRoute][what]=true;char m[100];std::snprintf(m,sizeof m,"hotkey %s via %s",what==1?"fullscreen":"close",pollRoute?"key polling (the window did not get the key message)":"window message");status(m);}
     if(what==1){if(windowAltEnter)toggleFullscreen(window);}
-    else if(what==3){hudHidden=!hudHidden;status(hudHidden?"HUD hidden (F10)":"HUD shown (F10)");}
     else closeGame(window);
 }
 DWORD WINAPI hotkeyThread(LPVOID) {
-    bool wasReturn=false,wasF11=false,wasF4=false,wasF10=false;
+    bool wasReturn=false,wasF11=false,wasF4=false;
     for(;;) {
         Sleep(15);
         HWND foreground=GetForegroundWindow();DWORD process=0;
@@ -258,9 +255,7 @@ DWORD WINAPI hotkeyThread(LPVOID) {
         if(ret && !wasReturn)PostMessageW(target,WM_RRHD_HOTKEY,1,0);
         if(f11 && !wasF11)PostMessageW(target,WM_RRHD_HOTKEY,1,0);
         if(f4 && !wasF4)PostMessageW(target,WM_RRHD_HOTKEY,2,0);
-        bool f10=mine && hudToggleKey && (GetAsyncKeyState(VK_F10)&0x8000)!=0;
-        if(f10 && !wasF10)PostMessageW(target,WM_RRHD_HOTKEY,3,0);
-        wasReturn=ret;wasF11=f11;wasF4=f4;wasF10=f10;
+        wasReturn=ret;wasF11=f11;wasF4=f4;
     }
     return 0;
 }
@@ -377,7 +372,6 @@ using DispatchMessageFn=LRESULT(WINAPI*)(const MSG*);
 DispatchMessageFn originalDispatchMessage=nullptr;
 LRESULT WINAPI dispatchMessageHook(const MSG* message) {
     if(message && message->message==WM_RRHD_HOTKEY) {hotkeyAction(message->hwnd,int(message->wParam),"poll");return 0;}
-    if(message && hudToggleKey && (message->message==WM_SYSKEYDOWN || message->message==WM_SYSKEYUP) && message->wParam==VK_F10)return 0;   // F10 would activate the window menu
     if(message && message->message==WM_SYSKEYDOWN && message->wParam==VK_F4 && (message->lParam&(1<<29))) {
         HWND target=hookedWindow?hookedWindow:GetAncestor(message->hwnd,GA_ROOTOWNER);
         if(target){hotkeyAction(target,2,"message");return 0;}
@@ -1020,7 +1014,6 @@ void fillUiSpan(int y,int left,int right,uint32_t color) {
 uint8_t uiMask[480*640];uint32_t uiColorBuf[480*640];
 bool uiRowDirty[480];int uiRowMinX[480],uiRowMaxX[480];int uiDirtyMin=480,uiDirtyMax=-1;
 void uiSpan(int y,int left,int right,uint32_t color) {
-    if(hudHidden)return;
     if(!(gpu.ready() && gpuRequested)){fillUiSpan(y,left,right,color);return;}
     for(int x=left;x<right;++x){uiMask[y*640+x]=1;uiColorBuf[y*640+x]=color;}
     if(!uiRowDirty[y]){uiRowDirty[y]=true;uiRowMinX[y]=left;uiRowMaxX[y]=right;}
@@ -2015,8 +2008,6 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     fixPostcards=GetPrivateProfileIntW(L"Game",L"FixPostcards",1,configPath.c_str())!=0;
     fixBikeColors=GetPrivateProfileIntW(L"Game",L"FixBikeColors",1,configPath.c_str())!=0;
     keyboardAndPad=GetPrivateProfileIntW(L"Input",L"KeyboardAndPad",1,configPath.c_str())!=0;
-    hudToggleKey=GetPrivateProfileIntW(L"Input",L"HudToggleKey",1,configPath.c_str())!=0;
-    hudHidden=GetPrivateProfileIntW(L"Graphics",L"HideHud",0,configPath.c_str())!=0;
     rememberLastSave=GetPrivateProfileIntW(L"Game",L"RememberLastSave",1,configPath.c_str())!=0;
     videoVolume=int(GetPrivateProfileIntW(L"Game",L"VideoVolume",100,configPath.c_str()));
     if(videoVolume<0)videoVolume=0;if(videoVolume>100)videoVolume=100;

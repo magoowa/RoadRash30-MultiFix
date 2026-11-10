@@ -2,17 +2,12 @@
 
 ## 2.17.2
 
-- **No backup folder:** the installer no longer creates `ResolutionPatch_Backup`. A different `ddraw.dll` that was in the way is kept next to the new one as `ddraw.dll.multifix-backup` (and put back on Restore); nothing else is stored. Our own files are recognised by a tag inside them. An older install is migrated (a saved original becomes the `.multifix-backup` file) and its backup folder is removed.
-- **F10 hides / shows the HUD** (names, bars, messages) during the game (`[Input] HudToggleKey`; `[Graphics] HideHud` sets the start state).
 - **Keyboard + Controller Together** (`[Input] KeyboardAndPad`, launcher option, on by default): the game read only the control device saved in the profile, so a profile set to the keyboard ignored the pad in a race. Both are read now, and missing pad assignments of a keyboard profile are filled in with the game's defaults.
 - **Hotkeys fixed:** F11, Alt+Enter and Alt+F4 also work when the key message does not reach the game window (the keys are watched as well).
 - **Videos follow the window:** after F11 / Alt+Enter the game is told whether it is windowed, so videos play in the window and not over the whole screen. A window made from fullscreen is 4:3 when Widescreen is off.
-- **Race Resolution** list: 4:3 choices with Widescreen off; the controller operates the dialog directly (D-pad, A, B).
 - **Widescreen Game switch fixed:** with it off (`[Window] WideWindow=0`) the game now plays in the original 4:3 aspect.
 - **Load Game remembers the last save** (`[Game] RememberLastSave`, on by default): the Open dialog starts with the save you used last already selected (the name is kept in `[Game] LastSave` after every Open or Save as).
-- **Test builds carry a date code** (title, log, launcher); `build.py --release` leaves it out.
-- **iGPU Performance Boost:** the launcher option formerly called "Intel iGPU Battery Boost" has a clearer name (same setting, `[Performance] LowLatency`); the "Widescreen" option no longer says 16:9.
-- **Launcher:** after a netplay download (or any change of the information rows) the window grows with its content instead of showing a horizontal scroll bar.
+
 
 ## 2.16.0
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.17.2
+## 2.17.3
 
 - **Keyboard + Controller Together** (`[Input] KeyboardAndPad`, launcher option, on by default): the game read only the control device saved in the profile, so a profile set to the keyboard ignored the pad in a race. Both are read now, and missing pad assignments of a keyboard profile are filled in with the game's defaults.
 - **Hotkeys fixed:** F11, Alt+Enter and Alt+F4 also work when the key message does not reach the game window (the keys are watched as well).

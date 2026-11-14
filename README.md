@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/logo.png" width="420" alt="Road Rash 30 MultiFix"></p>
 
-<p align="center"><b>v2.18.0</b> &nbsp;|&nbsp; <a href="https://github.com/magoowa/RoadRash30-MultiFix/releases/latest"><b>Download the latest release</b></a> &nbsp;|&nbsp; <a href="CHANGELOG.md">Changelog</a></p>
+<p align="center"><b>v2.18.6</b> &nbsp;|&nbsp; <a href="https://github.com/magoowa/RoadRash30-MultiFix/releases/latest"><b>Download the latest release</b></a> &nbsp;|&nbsp; <a href="CHANGELOG.md">Changelog</a></p>
 
 Fixes, widescreen and a Direct3D 11 renderer for **Road Rash: 30th Anniversary Edition** (GOG, EA app and Steam). Authors: **OBLPlife** (original author) and **magoowa**.
 
@@ -50,11 +50,12 @@ Added in this fork:
 - **Installer and launcher:** detects GOG, EA app and Steam installations, shows the executable version, has one row per option (read from and saved to `RoadRashHD.ini` live), a **Play** button, detection of the MultiFix installation and its DLL version in the game folder (if it is missing or outdated, Play asks whether to install/update first; Yes or No, the game starts either way), backup/restore, HiDPI-safe layout and a custom icon.
 - **Pedestrian sounds:** new voices and collision reactions for every kind of pedestrian (including the flag girls and the people at the start), and pedestrians that are no longer far quieter than the rider.
 - **Sprite fixes:** the damaged shadow of the first punch frame and the buildings that hover above the ground (red barn, brown shop, white house) are fixed in memory.
-- **Controllers:** analog throttle on the right trigger; a native DualSense no longer scrolls the menus by itself; after Alt+Tab or a click on another monitor, Start + Back on an Xbox pad brings the game back to the front (always on); optional DualSense support (Bluetooth, d-pad), based on the findings and the local patch of **CypherCripto** ([issue #4](https://github.com/magoowa/RoadRash30-MultiFix/issues/4)).
+- **Controllers:** analog throttle on the right trigger; a native DualSense no longer scrolls the menus by itself; optional DualSense support (Bluetooth, d-pad), based on the findings and the local patch of **CypherCripto** ([issue #4](https://github.com/magoowa/RoadRash30-MultiFix/issues/4)).
 - **Dual monitor UX improvements (optional):** the mouse is not confined to the game window and the game is not minimized when it loses focus.
 - **Stutter Fix:** the controller scan that froze the game for ~165 ms every two seconds now runs in the background.
 - **Windowed mode from the game menu** keeps the configured window size (`[Window] Width/Height` or automatic 16:9) instead of switching to 4:3.
 - **Netplay download:** the launcher shows whether `wsock32.dll` (OKPlay) is in the game folder. If not, the **download netplay** link fetches the newest package from oldkid.net (OKPlay GitHub release as fallback) and unpacks `netcheck.exe`, `okplay.ini` (an existing one is kept), `wsock32.dll` and `oldkid_netplay_readme.txt` into the game folder.
+- **Muted Sound Fix:** with the music slider at 0 in the Sound Mix screen only the music is muted; the game is no longer silenced in the Windows volume mixer (launcher option).
 - **FMV Volume:** a slider in the launcher sets the volume of all intro and story videos (.avi and .mp4), 0-100 %.
 - **Fix Bike Colors:** the Rat and Super bikes have each other's colours in the race (the shop pictures are right); the two groups of five colour tables are swapped back (the same change as Anakin94's fix for the 1996 exe). Thanks to Anakin94 and peemosa for finding the bug.
 - **Fix Text Encoding:** Unicode text the game misreads (the trademark sign shown as `â„¢`, curly quotes, accents) is displayed correctly even with Windows' UTF-8 system code page.
@@ -114,6 +115,7 @@ All options are in `RoadRashHD.ini` (game folder) and in the installer/launcher 
 | `[Audio]` | `PedestrianVoiceRelief` | 100 | The same for the pedestrians' voices alone (not the thump or the footsteps); 100 = as loud as the rider's own sounds. |
 | `[Audio]` | `FemaleVoiceFallback` | 1 | The woman pedestrian that has no voice in the game's data gets the unused voices `FG1_WATC` / `FG2_EEK`. |
 | `[Audio]` | `PedestrianVoiceGapMs` | 120 | Minimum time in milliseconds between two first-reaction voices of pedestrians (0 = no limit). |
+| `[Audio]` | `MidiVolumeGuard` | 1 | A MIDI music volume of 0 (Sound Mix: Master x Game music) is not passed to Windows (launcher: Muted Sound Fix). On some Windows versions that call changes the volume of the whole game in the volume mixer and Windows remembers it, so the game had no sound at all, even after a restart. |
 | `[Game]` | `VideoVolume` | 100 | Volume of all videos (.avi and .mp4) in percent of the game's volume (launcher: FMV Volume slider). |
 
 Advanced options, not shown in the launcher (add them to the ini):

@@ -116,6 +116,9 @@ static void orientationTests() {
 }
 
 int wmain(int argc,wchar_t** argv) {
+    // the MIDI volume guard: only a silent request is held back
+    require(midiVolumeIsSilent(0) && midiVolumeIsSilent(0x0bb80bb8) && midiVolumeIsSilent(0x0ccb0000),"silent MIDI volumes are held back");
+    require(!midiVolumeIsSilent(0x0ccc0ccc) && !midiVolumeIsSilent(0xff00ff00) && !midiVolumeIsSilent(0x80000000) && !midiVolumeIsSilent(0x0000ffff) && !midiVolumeIsSilent(0xffffffff),"audible MIDI volumes pass");
     ensureCpuWorld();rasterTests();require(argc==2,"EXE fixture path");
     HMODULE module=LoadLibraryExW(argv[1],nullptr,DONT_RESOLVE_DLL_REFERENCES);
     require(module!=nullptr,"map original executable without executing it");

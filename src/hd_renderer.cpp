@@ -465,43 +465,9 @@ LRESULT CALLBACK renderWindowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) 
     if(message==WM_NCDESTROY){hookedWindow=nullptr;previousWindowProc=nullptr;completedFrame=false;}
     return result;
 }
-// Bringing the game back with the pad ([Input] PadRestore). After Alt+Tab (or a click on another monitor) the game sits in the background, often
-// minimized, and no pad button reaches it, so the keyboard or mouse was needed to return. While the game is not the active application (the
-// game's own flag 0x5a2928 is 0), this thread watches the first XInput pad (XInput works without focus); Start + Back pressed together restores the
-// window and takes the focus. It does nothing while the game is active, so no game control is changed.
-void bringGameToFront(HWND window) {
-    if(IsIconic(window))ShowWindow(window,SW_RESTORE);
-    HWND foreground=GetForegroundWindow();
-    DWORD foregroundThread=foreground?GetWindowThreadProcessId(foreground,nullptr):0,thisThread=GetCurrentThreadId();
-    bool attached=foregroundThread && foregroundThread!=thisThread && AttachThreadInput(thisThread,foregroundThread,TRUE);
-    keybd_event(VK_MENU,0,0,0);keybd_event(VK_MENU,0,KEYEVENTF_KEYUP,0);   // lets SetForegroundWindow through the foreground lock
-    BringWindowToTop(window);SetForegroundWindow(window);
-    SwitchToThisWindow(window,TRUE);   // works where SetForegroundWindow is refused
-    if(attached)AttachThreadInput(thisThread,foregroundThread,FALSE);
-}
-DWORD WINAPI padRestoreThread(LPVOID) {
-    auto getState=xinputGetState();if(!getState)return 0;
-    const WORD combo=0x0010|0x0020;   // Start | Back
-    bool wasDown=true;int attempts=0;
-    for(;;) {
-        Sleep(80);
-        HWND window=hookedWindow;
-        if(!window || at<uint8_t>(0x5a2928)){wasDown=true;attempts=0;continue;}   // active: nothing to do (and a combo held on the way out must be released first)
-        XInputPad pad{};
-        bool down=getState(0,&pad)==0 && (pad.buttons&combo)==combo;
-        if(!down){wasDown=false;attempts=0;continue;}
-        // pressed: bring the window back; if the game is still not active a moment later (focus lock), try again while the buttons are held
-        if(!wasDown || (++attempts%5==0 && attempts<=25)) {
-            bringGameToFront(window);
-            if(!wasDown)status("pad: Start + Back pressed while the game was in the background, window brought to the front");
-        }
-        wasDown=true;
-    }
-}
 void logWindow(HWND window);
 void hookWindow(HWND window) {
     themeThread();
-    {static bool started=false;if(!started && window){started=true;HANDLE h=CreateThread(nullptr,0,padRestoreThread,nullptr,0,nullptr);if(h)CloseHandle(h);}}
     {static bool started=false;if(!started && window){started=true;HANDLE h=CreateThread(nullptr,0,hotkeyThread,nullptr,0,nullptr);if(h)CloseHandle(h);}}
     if(!window || hookedWindow==window)return;
     auto previous=reinterpret_cast<WNDPROC>(SetWindowLongPtrA(window,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(&renderWindowProc)));
@@ -1801,27 +1767,76 @@ DWORD WINAPI videoSkipThread(LPVOID context) {
 // Video volume ([Game] VideoVolume, 0-100). Both players (MCI for .avi, Media Foundation for .mp4) play through
 // the process's default audio session, so while a video plays that session's volume is scaled by the setting and
 // restored afterwards (the Windows volume mixer's own level for the game is kept as the reference).
+// Windows REMEMBERS the volume of an application between starts, so a scaled volume must never be left behind: the real
+// level is written to %LOCALAPPDATA%\RoadRashMultiFix\session_volume.txt before it is scaled and put back afterwards. When the game
+// is closed in the middle of a video (Alt+F4, a crash, the task manager) the file is still there at the next start, and the
+// level is put back then (healSessionVolumeThread). Without this a game closed during a video stayed quieter, and every such
+// close scaled it down again.
+std::string sessionBaselinePath() {
+    char root[MAX_PATH]{};
+    DWORD n=GetEnvironmentVariableA("LOCALAPPDATA",root,sizeof root);
+    if(n==0 || n>=MAX_PATH-64)return std::string();
+    std::string dir=std::string(root)+"\\RoadRashMultiFix";CreateDirectoryA(dir.c_str(),nullptr);
+    return dir+"\\session_volume.txt";
+}
+ISimpleAudioVolume* acquireSessionVolume() {   // COM must be initialised in the calling thread
+    IMMDeviceEnumerator* enumerator=nullptr;IMMDevice* device=nullptr;IAudioSessionManager* manager=nullptr;ISimpleAudioVolume* volume=nullptr;
+    if(SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator),nullptr,CLSCTX_ALL,__uuidof(IMMDeviceEnumerator),reinterpret_cast<void**>(&enumerator))) &&
+       SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender,eConsole,&device)) &&
+       SUCCEEDED(device->Activate(__uuidof(IAudioSessionManager),CLSCTX_ALL,nullptr,reinterpret_cast<void**>(&manager))) &&
+       SUCCEEDED(manager->GetSimpleAudioVolume(nullptr,FALSE,&volume)) && volume) {}
+    else volume=nullptr;
+    if(manager)manager->Release();if(device)device->Release();if(enumerator)enumerator->Release();
+    return volume;
+}
+LONG videoScopeDepth=0;
 struct VideoVolumeScope {
-    ISimpleAudioVolume* volume=nullptr;float original=1.0f;bool uninitialize=false;
+    ISimpleAudioVolume* volume=nullptr;float original=1.0f;bool uninitialize=false,counted=false;std::string file;
     explicit VideoVolumeScope(int percent) {
         if(percent>=100)return;
+        counted=true;
+        if(InterlockedIncrement(&videoScopeDepth)>1)return;   // an outer video already scaled the volume: it restores it
         HRESULT hr=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
         uninitialize=SUCCEEDED(hr);
-        IMMDeviceEnumerator* enumerator=nullptr;IMMDevice* device=nullptr;IAudioSessionManager* manager=nullptr;
-        if(SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator),nullptr,CLSCTX_ALL,__uuidof(IMMDeviceEnumerator),reinterpret_cast<void**>(&enumerator))) &&
-           SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender,eConsole,&device)) &&
-           SUCCEEDED(device->Activate(__uuidof(IAudioSessionManager),CLSCTX_ALL,nullptr,reinterpret_cast<void**>(&manager))) &&
-           SUCCEEDED(manager->GetSimpleAudioVolume(nullptr,FALSE,&volume)) && volume) {
-            if(SUCCEEDED(volume->GetMasterVolume(&original)))volume->SetMasterVolume(original*(percent<0?0:percent)/100.0f,nullptr);
-            else{volume->Release();volume=nullptr;}
+        volume=acquireSessionVolume();
+        if(volume) {
+            if(SUCCEEDED(volume->GetMasterVolume(&original))) {
+                file=sessionBaselinePath();
+                if(!file.empty()) {   // the real level first, so that a game closed during the video can put it back
+                    HANDLE f=CreateFileA(file.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+                    if(f!=INVALID_HANDLE_VALUE){char text[32];int length=std::snprintf(text,sizeof text,"%.4f",double(original));DWORD put=0;WriteFile(f,text,DWORD(length),&put,nullptr);CloseHandle(f);}
+                }
+                volume->SetMasterVolume(original*(percent<0?0:percent)/100.0f,nullptr);
+            } else {volume->Release();volume=nullptr;}
         }
-        if(manager)manager->Release();if(device)device->Release();if(enumerator)enumerator->Release();
     }
     ~VideoVolumeScope() {
+        if(!counted)return;
+        if(InterlockedDecrement(&videoScopeDepth)>0)return;
         if(volume){volume->SetMasterVolume(original,nullptr);volume->Release();}
+        if(!file.empty())DeleteFileA(file.c_str());
         if(uninitialize)CoUninitialize();
     }
 };
+// At every start: a level left in session_volume.txt by a game that was closed in the middle of a video is put back.
+DWORD WINAPI healSessionVolumeThread(LPVOID) {
+    std::string file=sessionBaselinePath();
+    if(file.empty())return 0;
+    HANDLE f=CreateFileA(file.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(f==INVALID_HANDLE_VALUE)return 0;
+    char text[32]{};DWORD got=0;ReadFile(f,text,sizeof text-1,&got,nullptr);CloseHandle(f);
+    float level=float(std::atof(text));
+    if(level>=0.01f && level<=1.0f) {
+        HRESULT hr=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+        if(ISimpleAudioVolume* volume=acquireSessionVolume()) {
+            volume->SetMasterVolume(level,nullptr);volume->Release();
+            char m[120];std::snprintf(m,sizeof m,"audio: the game's volume in the Windows mixer was left scaled by a video; put back to %.0f %%",double(level)*100.0);status(m);
+        }
+        if(SUCCEEDED(hr))CoUninitialize();
+    }
+    DeleteFileA(file.c_str());
+    return 0;
+}
 // Louder pedestrians ([Audio] LouderPedestrians, PedestrianGainDb). The voices and footsteps of pedestrians are barely heard
 // in a race (the footsteps are recorded about 14 dB below the average effect, several voices 6-9 dB). The game opens every
 // effect with mmioOpenA. For the pedestrian sounds the open is redirected to a louder copy (a soft limiter keeps the peaks
@@ -1925,6 +1940,7 @@ HMMIO WINAPI mmioOpenHook(LPSTR name,LPMMIOINFO info,DWORD flags) {
 // [Audio] PedestrianVolumeRelief (percent) reduces that attenuation for the pedestrian sounds (0 = as the game sets it).
 struct SoundInfo{std::string name;LONG volume=0;bool volumeSet=false;};
 std::unordered_map<void*,SoundInfo> soundBuffers;
+bool audioTrace=false;   // [Debug] AudioTrace: logs the calls that can change the volume of the whole game in the Windows mixer
 int soundLogged=0,pedestrianRelief=60,pedestrianVoiceRelief=100,pedestrianVoiceGapMs=120;bool femaleVoiceFallback=true;DWORD soundStart=GetTickCount();
 using CreateBufferFn=HRESULT(STDMETHODCALLTYPE*)(void*,const DSBUFFERDESC*,LPDIRECTSOUNDBUFFER*,IUnknown*);
 using DuplicateBufferFn=HRESULT(STDMETHODCALLTYPE*)(void*,LPDIRECTSOUNDBUFFER,LPDIRECTSOUNDBUFFER*);
@@ -1975,7 +1991,12 @@ HRESULT STDMETHODCALLTYPE bufferSetVolumeHook(void* self,LONG volume) {
         }
         s->second.volume=volume;s->second.volumeSet=true;
     }
+    std::string traceName;
+    if(audioTrace){auto t=soundBuffers.find(self);if(t!=soundBuffers.end())traceName=t->second.name;}
     LeaveCriticalSection(&soundLock);
+    if(audioTrace && (traceName=="<primary>" || volume<=-3000)) {
+        char m[160];std::snprintf(m,sizeof m,"audio trace: DirectSound SetVolume(%s) = %ld from 0x%x",traceName.empty()?"?":traceName.c_str(),long(volume),unsigned(reinterpret_cast<uintptr_t>(_ReturnAddress())-base+0x400000));status(m);
+    }
     return original?original(self,volume):E_FAIL;
 }
 ULONG STDMETHODCALLTYPE bufferReleaseHook(void* self) {
@@ -2010,6 +2031,9 @@ void watchBuffer(void* buffer,const std::string& name) {
 }
 HRESULT STDMETHODCALLTYPE createBufferHook(void* self,const DSBUFFERDESC* desc,LPDIRECTSOUNDBUFFER* buffer,IUnknown* outer) {
     HRESULT hr=originalCreateBuffer(self,desc,buffer,outer);
+    if(audioTrace && SUCCEEDED(hr) && buffer && *buffer && desc && (desc->dwFlags&DSBCAPS_PRIMARYBUFFER)) {
+        watchBuffer(*buffer,"<primary>");status("audio trace: DirectSound primary buffer is watched");
+    }
     if(SUCCEEDED(hr) && buffer && *buffer && desc && !(desc->dwFlags&DSBCAPS_PRIMARYBUFFER)) {
         std::string name;
         EnterCriticalSection(&soundLock);name=lastOpenedWav;lastOpenedWav.clear();LeaveCriticalSection(&soundLock);
@@ -2025,6 +2049,41 @@ HRESULT STDMETHODCALLTYPE duplicateBufferHook(void* self,LPDIRECTSOUNDBUFFER sou
         if(!name.empty())watchBuffer(*buffer,name);
     }
     return hr;
+}
+// Diagnostics: every call that can move the game's volume in the Windows mixer (the MIDI volume of the music, MCI audio settings).
+bool readInt(const void* address,int* value);
+using MidiSetVolumeFn=MMRESULT(WINAPI*)(HMIDIOUT,DWORD);MidiSetVolumeFn originalMidiSetVolume=nullptr;
+// [Audio] MidiVolumeGuard. The game sets the volume of its MIDI music with midiOutSetVolume (Master x Game music from the Sound Mix screen). On a
+// Windows where the MIDI device supports volume (the Microsoft GS Wavetable Synth, a virtual synth, the new Windows MIDI Services) that call is applied
+// to the WHOLE application in the Windows volume mixer, and Windows remembers it: a music slider at 0 left the game without any sound, also after a
+// restart, until the level was raised in the Windows mixer. A silent request is therefore not passed on; the music is muted by the game itself (its mute
+// flag) and every other value still reaches the device.
+bool midiVolumeGuard=true;
+bool midiVolumeIsSilent(DWORD volume) {   // both channels below about 5 % (0x0ccc of 0xffff): not audible anyway
+    return (volume&0xffff)<0x0ccc && (volume>>16)<0x0ccc;
+}
+MMRESULT WINAPI midiSetVolumeHook(HMIDIOUT device,DWORD volume) {
+    MMRESULT result;
+    bool held=midiVolumeGuard && midiVolumeIsSilent(volume);
+    if(held) {
+        result=MMSYSERR_NOERROR;
+        static bool logged=false;
+        if(!logged){logged=true;char m[160];std::snprintf(m,sizeof m,"audio: MIDI volume 0x%08x requested by the game is not passed on (Windows would apply it to the whole game)",unsigned(volume));status(m);}
+    } else result=originalMidiSetVolume?originalMidiSetVolume(device,volume):MMSYSERR_ERROR;
+    if(audioTrace) {
+        char m[160];std::snprintf(m,sizeof m,"audio trace: midiOutSetVolume(0x%x, 0x%08x) -> %u%s from 0x%x",unsigned(reinterpret_cast<uintptr_t>(device)),unsigned(volume),unsigned(result),held?" (held back)":"",
+                                  unsigned(reinterpret_cast<uintptr_t>(_ReturnAddress())-base+0x400000));status(m);
+    }
+    return result;
+}
+using MciSendCommandFn=MCIERROR(WINAPI*)(MCIDEVICEID,UINT,DWORD_PTR,DWORD_PTR);MciSendCommandFn originalMciSendCommand=nullptr;
+MCIERROR WINAPI mciSendCommandHook(MCIDEVICEID device,UINT message,DWORD_PTR flags,DWORD_PTR parameters) {
+    if(message==0x0873) {   // MCI_SETAUDIO
+        int item=0,value=0;readInt(reinterpret_cast<const void*>(parameters+sizeof(DWORD_PTR)),&item);readInt(reinterpret_cast<const void*>(parameters+sizeof(DWORD_PTR)+4),&value);
+        char m[140];std::snprintf(m,sizeof m,"audio trace: MCI_SETAUDIO flags 0x%x item 0x%x value %d from 0x%x",unsigned(flags),unsigned(item),value,
+                                  unsigned(reinterpret_cast<uintptr_t>(_ReturnAddress())-base+0x400000));status(m);
+    }
+    return originalMciSendCommand(device,message,flags,parameters);
 }
 using DirectSoundCreateFn=HRESULT(WINAPI*)(LPCGUID,LPDIRECTSOUND*,IUnknown*);
 DirectSoundCreateFn originalDirectSoundCreate=nullptr;
@@ -2963,6 +3022,18 @@ bool initialize(HMODULE module) {
         void* original=nullptr;   // the game opens every sound effect with mmioOpenA (one call site, 0x42900d)
         if(hookImport(0x61c868,L"winmm.dll","mmioOpenA",reinterpret_cast<void*>(&mmioOpenHook),&original))originalMmioOpen=reinterpret_cast<MmioOpenFn>(original);
         else {quietEffects=false;soundWatch=false;status("louder pedestrians ignored: unexpected import table");}
+        if(midiVolumeGuard || audioTrace) {
+            void* o=nullptr;
+            if(hookImport(0x61c884,L"winmm.dll","midiOutSetVolume",reinterpret_cast<void*>(&midiSetVolumeHook),&o)) {
+                originalMidiSetVolume=reinterpret_cast<MidiSetVolumeFn>(o);
+                if(midiVolumeGuard)status("audio: the MIDI volume guard is on (a silent MIDI volume is not applied to the whole game)");
+            }
+        }
+        if(audioTrace) {
+            void* o=nullptr;
+            if(hookImport(0x61c85c,L"winmm.dll","mciSendCommandA",reinterpret_cast<void*>(&mciSendCommandHook),&o))originalMciSendCommand=reinterpret_cast<MciSendCommandFn>(o);
+            status("audio trace: midiOutSetVolume, mciSendCommand and the DirectSound primary buffer are watched");
+        }
         original=nullptr;         // DirectSoundCreate: its buffers are matched with the effect files
         if(soundWatch && hookImport(0x61c118,L"dsound.dll","DirectSoundCreate",reinterpret_cast<void*>(&directSoundCreateHook),&original))originalDirectSoundCreate=reinterpret_cast<DirectSoundCreateFn>(original);
         else soundWatch=false;
@@ -3175,6 +3246,7 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     keyboardAndPad=GetPrivateProfileIntW(L"Input",L"KeyboardAndPad",1,configPath.c_str())!=0;
     rememberLastSave=GetPrivateProfileIntW(L"Game",L"RememberLastSave",1,configPath.c_str())!=0;
     videoVolume=int(GetPrivateProfileIntW(L"Game",L"VideoVolume",100,configPath.c_str()));
+    {HANDLE h=CreateThread(nullptr,0,healSessionVolumeThread,nullptr,0,nullptr);if(h)CloseHandle(h);}
     if(videoVolume<0)videoVolume=0;if(videoVolume>100)videoVolume=100;
     fullRateObjects=GetPrivateProfileIntW(L"Game",L"FullRateObjects",1,configPath.c_str())!=0;
     quietEffects=GetPrivateProfileIntW(L"Audio",L"LouderPedestrians",1,configPath.c_str())!=0;
@@ -3182,11 +3254,13 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     pedestrianRelief=std::max(0,std::min(100,int(GetPrivateProfileIntW(L"Audio",L"PedestrianVolumeRelief",60,configPath.c_str()))));
     pedestrianVoiceRelief=std::max(0,std::min(100,int(GetPrivateProfileIntW(L"Audio",L"PedestrianVoiceRelief",100,configPath.c_str()))));
     femaleVoiceFallback=GetPrivateProfileIntW(L"Audio",L"FemaleVoiceFallback",1,configPath.c_str())!=0;
+    midiVolumeGuard=GetPrivateProfileIntW(L"Audio",L"MidiVolumeGuard",1,configPath.c_str())!=0;
     pedestrianVoiceGapMs=std::max(0,std::min(2000,int(GetPrivateProfileIntW(L"Audio",L"PedestrianVoiceGapMs",120,configPath.c_str()))));
     voiceRulesOn=GetPrivateProfileIntW(L"Audio",L"PedestrianVoiceRules",1,configPath.c_str())!=0;
     if(voiceRulesOn)loadVoiceRules();
     dumpEverySeconds=debugInt(L"DumpFrameEverySeconds",0,configPath.c_str());
     quadDiagnostics=debugInt(L"QuadDiagnostics",0,configPath.c_str())!=0;
+    audioTrace=debugInt(L"AudioTrace",0,configPath.c_str())!=0;
     smoothHorizon=GetPrivateProfileIntW(L"Graphics",L"SmoothHorizon",0,configPath.c_str())!=0;
     dumpScale=debugInt(L"DumpScale",2,configPath.c_str());
     windowAltEnter=GetPrivateProfileIntW(L"Window",L"AltEnterFullscreen",1,configPath.c_str())!=0;

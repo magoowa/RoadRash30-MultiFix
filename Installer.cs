@@ -78,6 +78,7 @@ internal static class Installer
         new PatchOption("Audio", "PedestrianVoiceRules", true, "New Pedestrian Voices", "Bystanders, bikers, cops and others shout with a chosen pool of voices; flag girls and people at the start react too"),
         new PatchOption("Audio", "LouderPedestrians", true, "Louder Pedestrians", "Pedestrian voices and footsteps are no longer far quieter than the rider"),
         new PatchOption("Game", "SkipIntro", false, "Skip Intro Videos", "Skips the studio logos and the intro movie (menu music still starts)"),
+        new PatchOption("Audio", "MidiVolumeGuard", true, "Muted Sound Fix", "Music slider at 0 mutes only the music; the game is no longer silenced in the Windows volume mixer"),
     };
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]

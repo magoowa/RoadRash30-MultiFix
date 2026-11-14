@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.18.6
+
+**Sound**
+- **Muted Sound Fix** (`[Audio] MidiVolumeGuard`, on by default, launcher option). What was wrong: with the music slider at 0 in the Sound Mix screen the game asked Windows to set its MIDI volume to 0. On some Windows versions that call is applied to the whole game in the Windows volume mixer, so the game went completely silent (music, effects and videos) and Windows remembered it, also after a restart. What changed: a silent MIDI volume is no longer passed on to Windows; the music is muted by the game itself and the game's level in the volume mixer stays untouched. If the game is already stuck at zero, raise its slider once in Windows Settings > System > Sound > Volume mixer.
+- **FMV Volume fix** (always on, no switch). The FMV Volume slider works by scaling the game's volume in the Windows volume mixer while a video plays and restoring it afterwards. If the game was closed in the middle of a video (Alt+F4, a crash), the scaled level stayed and Windows started the game quieter next time. The original level is now remembered and restored at the next start, and a video that starts while another one is scaled no longer scales the level a second time.
+
 ## 2.18.0
 
 **Sound**
@@ -13,7 +19,6 @@
 - **A native DualSense no longer scrolls the menus by itself** (always on): the game opened every HID interface of the pad, including ones that are not a game pad; only game pad and joystick interfaces are opened now. Found by CypherCripto (issue #4).
 - **DualSense support** (`[Input] DualSense`, off by default, launcher option): Bluetooth reports and d-pad steering and menus, diagonals too. Written from the report and checked against the game code; not tested without a DualSense. Skipping the intro videos with a pad that is not an XInput one (DualSense, DualShock) works too.
 - **Analog throttle on the right trigger** (`[Input] AnalogThrottle` and `Throttle*`): the throttle follows the pressure of the trigger, so slow speeds can be held.
-- **Back to the game with the pad** (always on): after Alt+Tab or a click on another monitor the game stays in the background and only the keyboard or mouse could bring it back. While the game is not the active window, Start + Back on an Xbox pad restores it and takes the focus; nothing changes while you play.
 - **Dual monitor UX improvements** (`[Window] DualMonitorUX`, off by default, launcher option): the mouse is not confined to the game window and the game is not minimized when you click another monitor.
 
 **Proton, Wine and Linux** (no switches, always on)

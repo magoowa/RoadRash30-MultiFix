@@ -85,7 +85,14 @@ internal static class WindowTest
                     say.Invoke(window, new object[] { "Netplay installed from oldkid.net: wsock32.dll, netcheck.exe, okplay.ini and oldkid_netplay_readme.txt are in the game folder." });
                     for (int i = 0; i < 5; ++i) Application.DoEvents();
                     var scrollPanel = (ScrollableControl)window.Controls.Find("ScrollPanel", true)[0];
-                    if (scrollPanel.HorizontalScroll.Visible) throw new InvalidOperationException("A status line must not bring up a horizontal scroll bar");
+                    if (scrollPanel.HorizontalScroll.Visible) {
+                        var wide = new System.Text.StringBuilder();
+                        Action<Control, int> walk = null;
+                        walk = (c, depth) => { foreach (Control k in c.Controls) { int right = k.PointToScreen(new Point(k.Width, 0)).X - window.PointToScreen(Point.Empty).X; if (right > window.ClientSize.Width - 20 && k.Width > 60) wide.Append(k.Name + "/" + k.GetType().Name + "=" + k.Width + "@" + right + "; "); walk(k, depth + 1); } };
+                        walk(window, 0);
+                        throw new InvalidOperationException("WIDE: " + wide);
+                    }
+                    if (scrollPanel.HorizontalScroll.Visible) throw new InvalidOperationException("A status line must not bring up a horizontal scroll bar (window " + window.Width + "x" + window.Height + ", client " + window.ClientSize + ", min " + scrollPanel.AutoScrollMinSize + ", compact " + window.GetType().GetField("compact", BindingFlags.NonPublic | BindingFlags.Instance).GetValue(window) + ", area " + Screen.FromPoint(Cursor.Position).WorkingArea + ")");
                 }
                 // One margin: the content blocks and the button bar start at the same left edge, links and the logo click are wired.
                 {
@@ -100,7 +107,8 @@ internal static class WindowTest
                     {   // the credits sit in the columns of the options: names under the option names, text under the descriptions
                         var line = window.Controls.Find("VideoVolumeLine", true)[0]; 
                         var info = window.Controls.Find("InstallPanel", true)[0];
-                        if (info.PointToScreen(Point.Empty).X != line.PointToScreen(Point.Empty).X) throw new InvalidOperationException("The installations block must start on the description column (" + info.PointToScreen(Point.Empty).X + " vs " + line.PointToScreen(Point.Empty).X + ")");
+                        bool oneColumn = (bool)window.GetType().GetField("compact", BindingFlags.NonPublic | BindingFlags.Instance).GetValue(window);   // narrow screen: the options are one column
+                        if (!oneColumn && info.PointToScreen(Point.Empty).X != line.PointToScreen(Point.Empty).X) throw new InvalidOperationException("The installations block must start on the description column (" + info.PointToScreen(Point.Empty).X + " vs " + line.PointToScreen(Point.Empty).X + ")");
                     }
                     var bar0 = window.Controls.Find("ButtonBar", true)[0]; var buttons0 = window.Controls.Find("PlayButton", true)[0].Parent;
                     if (buttons0.Left != bar0.Padding.Left || bar0.Padding.Left != edge) throw new InvalidOperationException("The buttons must use the same margin as the content (buttons " + buttons0.Left + ", bar padding " + bar0.Padding.Left + ", content " + edge + ")");
@@ -269,6 +277,22 @@ internal static class WindowTest
                         var scroller = (ScrollableControl)small.Controls.Find("ScrollPanel", true)[0];
                         var bar = small.Controls.Find("ButtonBar", true)[0];
                         if (!scroller.VerticalScroll.Visible) throw new InvalidOperationException("A vertical scroll bar is expected on a small screen");
+                        if (scroller.HorizontalScroll.Visible) {
+                            var wide = new System.Text.StringBuilder();
+                            Action<Control> walk = null;
+                            walk = c => { foreach (Control k in c.Controls) { int right = k.PointToScreen(new Point(k.Width, 0)).X - small.PointToScreen(Point.Empty).X; if (right > small.ClientSize.Width - 30 && k.Width > 40) wide.Append(k.Name + "/" + k.GetType().Name + "=" + k.Width + "@" + right + "; "); walk(k); } };
+                            walk(small);
+                            var rootPanel = small.Controls.Find("RootPanel", true)[0];
+                            foreach (Control k in rootPanel.Controls) wide.Append("PREF " + k.Name + "/" + k.GetType().Name + "=" + k.GetPreferredSize(Size.Empty).Width + "; ");
+                            var headT = small.Controls.Find("HeadTable", true)[0];
+                            foreach (Control k in headT.Controls) wide.Append("HEAD " + k.Name + "=" + k.GetPreferredSize(Size.Empty).Width + "; ");
+                            var instP = small.Controls.Find("InstallPanel", true)[0];
+                            foreach (Control k in instP.Controls) wide.Append("INST " + k.Name + "=" + k.GetPreferredSize(Size.Empty).Width + "; ");
+                            throw new InvalidOperationException("A narrow screen must reflow to one column, not scroll sideways: client " + small.ClientSize + ", min " + scroller.AutoScrollMinSize + ", " + wide);
+                        }
+                        string lowResShot = Environment.GetEnvironmentVariable("RRMF_LOWRES_SHOT");
+                        if (!string.IsNullOrEmpty(lowResShot))
+                            using (var shot = new Bitmap(small.Width, small.Height)) { small.DrawToBitmap(shot, new Rectangle(Point.Empty, small.Size)); shot.Save(lowResShot, ImageFormat.Png); }
                         var playButton = (Control)small.Controls.Find("PlayButton", true)[0];
                         if (bar.Bottom > small.ClientSize.Height || !playButton.Visible || playButton.Bottom > bar.ClientSize.Height || playButton.Top < 0) throw new InvalidOperationException("The buttons must stay fully in view in the button bar");
                         var last = small.Controls.Find("ContributionsLabel", true)[0];

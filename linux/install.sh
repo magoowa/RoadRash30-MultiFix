@@ -4,7 +4,7 @@
 #
 #   ./install.sh                                                       finds the Steam copy by itself
 #   ./install.sh "/path/to/Road Rash 30th Anniversary Edition"         install / update in that folder
-#   ./install.sh "/path/to/Road Rash 30th Anniversary Edition" --remove   remove again
+#   ./install.sh "/path/to/Road Rash 30th Anniversary Edition" --remove   remove again (--remove alone: finds the game by itself)
 #   ./install.sh "/path/to/Road Rash 30th Anniversary Edition" --overwrite-ini   also replace RoadRashHD.ini
 #
 # IMPORTANT: copying the files is not enough. Wine/Proton only loads our ddraw.dll when this Steam launch option is set
@@ -13,8 +13,15 @@
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-game="${1:-}"
-action="${2:-install}"
+# options may stand anywhere: --remove, --overwrite-ini; the one other argument is the game folder
+game=""
+action="install"
+for arg in "$@"; do
+    case "$arg" in
+        --remove|--overwrite-ini) action="$arg";;
+        *) game="$arg";;
+    esac
+done
 LAUNCH='WINEDLLOVERRIDES="ddraw=n,b" %command%'
 
 # Show a message in the terminal; when there is no terminal (double-click in the file manager) also in a window.
@@ -26,6 +33,7 @@ say() {
         elif command -v xmessage >/dev/null 2>&1; then xmessage -center "$*" 2>/dev/null
         fi
     fi
+    return 0   # a missing or failing dialog tool must not change the result of the installation
 }
 fail() { say "$*" >&2; exit 1; }
 
@@ -73,6 +81,10 @@ In Steam: right-click the game > Manage > Browse local files shows that folder."
 fi
 
 if [[ "$action" == "--remove" ]]; then
+    # only our own files are touched: the proxy carries the tag RRMF_PROXY_TAG; a different ddraw.dll is left alone
+    if [[ -f "$game/ddraw.dll" ]] && ! grep -aq RRMF_PROXY_TAG "$game/ddraw.dll"; then
+        fail "$game/ddraw.dll is not the MultiFix proxy (another tool installed it), so nothing was removed."
+    fi
     rm -f "$game/RoadRashMultiFix.dll"
     if [[ -f "$game/ddraw.dll.multifix-backup" ]]; then
         mv -f "$game/ddraw.dll.multifix-backup" "$game/ddraw.dll"
@@ -88,13 +100,20 @@ for f in ddraw.dll RoadRashMultiFix.dll; do
 done
 
 # keep a different ddraw.dll that was already there
-if [[ -f "$game/ddraw.dll" ]] && ! cmp -s "$game/ddraw.dll" "$here/ddraw.dll" && [[ ! -f "$game/ddraw.dll.multifix-backup" ]]; then
+# (a ddraw.dll that carries our tag is an older MultiFix proxy and is simply replaced; a foreign one is never overwritten without a backup)
+if [[ -f "$game/ddraw.dll" ]] && ! cmp -s "$game/ddraw.dll" "$here/ddraw.dll" && ! grep -aq RRMF_PROXY_TAG "$game/ddraw.dll"; then
+    if [[ -f "$game/ddraw.dll.multifix-backup" ]]; then
+        fail "$game has a foreign ddraw.dll and an older ddraw.dll.multifix-backup. Nothing was changed: move or rename one of them and run this again."
+    fi
     cp -p "$game/ddraw.dll" "$game/ddraw.dll.multifix-backup"
     echo "Existing ddraw.dll saved as ddraw.dll.multifix-backup"
 fi
 cp -f "$here/ddraw.dll" "$here/RoadRashMultiFix.dll" "$game/" || fail "Could not copy the files into $game (is the folder writable?)."
 if [[ -f "$here/RoadRashHD.ini" ]] && { [[ ! -f "$game/RoadRashHD.ini" ]] || [[ "$action" == "--overwrite-ini" ]]; }; then
     cp -f "$here/RoadRashHD.ini" "$game/"
+fi
+if [[ -f "$here/PedestrianVoices.ini" && ! -f "$game/PedestrianVoices.ini" ]]; then
+    cp -f "$here/PedestrianVoices.ini" "$game/"
 fi
 
 say "MultiFix files are in: $game

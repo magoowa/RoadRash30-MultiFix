@@ -29,6 +29,10 @@ internal sealed class PatchWindow : Form
     readonly Label videoVolumeText = new Label();
     readonly FlowLayoutPanel languageRow = new FlowLayoutPanel();   // one radio button per language
     bool loading;
+    int infoWrap;                                                    // width limit of the info lines in the compact layout
+    bool compact;                                                    // narrow screens (low resolution / big display scale): one column, text wraps
+    readonly List<Label> optionHints = new List<Label>();
+    PictureBox logoBox; TableLayoutPanel headTable, optionRows, footerTable, rootPanel; Control creditsTable, aboutLabel, fmvLabel, fmvLine, fmvHint; FlowLayoutPanel buttonRow;
     string latestVersion, latestUrl;                                 // set when GitHub has a newer release
     bool netplayBusy;string netplayError;                            // netplay download state
 
@@ -58,7 +62,7 @@ internal sealed class PatchWindow : Form
         catch (Exception) { }
 
         int m = Margin12, rg = RowGap, wrap = Px(560);
-        var root = new TableLayoutPanel
+        var root = rootPanel = new TableLayoutPanel
         {
             Name = "RootPanel", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, Dock = DockStyle.Top,
             Padding = new Padding(m), MinimumSize = new Size(Px(700), 0)
@@ -66,7 +70,7 @@ internal sealed class PatchWindow : Form
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
 
         // Top block: the logo on the left (a click opens the project page), installations and info on the right.
-        var head = new TableLayoutPanel { Name = "HeadTable", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, m) };
+        var head = headTable = new TableLayoutPanel { Name = "HeadTable", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, m) };
         head.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100F)); head.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));   // first column: as wide as the option names, so the info block starts on the description column
         try
         {
@@ -77,7 +81,7 @@ internal sealed class PatchWindow : Form
                     stream.CopyTo(copy); copy.Position = 0;
                     var image = Image.FromStream(copy);
                     int width = Px(170), height = width * image.Height / image.Width;
-                    var logo = new PictureBox { Name = "LogoBox", Image = image, SizeMode = PictureBoxSizeMode.Zoom, Size = new Size(width, height), Margin = new Padding(0, 0, m, 0), Anchor = AnchorStyles.Top | AnchorStyles.Left, Cursor = Cursors.Hand };
+                    var logo = logoBox = new PictureBox { Name = "LogoBox", Image = image, SizeMode = PictureBoxSizeMode.Zoom, Size = new Size(width, height), Margin = new Padding(0, 0, m, 0), Anchor = AnchorStyles.Top | AnchorStyles.Left, Cursor = Cursors.Hand };
                     tips.SetToolTip(logo, Installer.ProjectUrl);
                     logo.Click += delegate { OpenUrl(Installer.ProjectUrl); };
                     head.Controls.Add(logo, 0, 0);
@@ -105,7 +109,7 @@ internal sealed class PatchWindow : Form
         tips.SetToolTip(languageRow, "Game/Language - game text language (the DLLs in the TEXT folder); Auto = the game's own setting");
 
         root.Controls.Add(new Label { Name = "OptionsLabel", Text = "Options (live from RoadRashHD.ini)", AutoSize = true, Margin = new Padding(0, 0, 0, m / 2) });
-        var rows = new TableLayoutPanel { Name = "OptionsTable", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, m) };
+        var rows = optionRows = new TableLayoutPanel { Name = "OptionsTable", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, m) };
         rows.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); rows.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
         int r = 0;
         foreach (var option in Installer.Options)
@@ -115,7 +119,7 @@ internal sealed class PatchWindow : Form
             var hint = new Label { Text = option.Hint, AutoSize = true, ForeColor = SystemColors.GrayText, Anchor = AnchorStyles.Left, Margin = new Padding(0, rg, 0, rg) };
             tips.SetToolTip(box, option.Section + "/" + option.Key + " - " + option.Hint);
             box.CheckedChanged += OptionChanged;
-            boxes.Add(box);
+            boxes.Add(box); optionHints.Add(hint);
             rows.Controls.Add(box, 0, r); rows.Controls.Add(hint, 1, r); ++r;
         }
         // FMV volume as in the design: the name under the option names (lined up with their text), the slider and its value
@@ -130,6 +134,7 @@ internal sealed class PatchWindow : Form
             var hint = new Label { Text = "Volume of the intro and story videos (.avi and .mp4)", AutoSize = true, ForeColor = SystemColors.GrayText, Anchor = AnchorStyles.Left, Margin = new Padding(0, rg, 0, rg) };
             tips.SetToolTip(videoVolume, "Game/VideoVolume - volume of all videos, 0-100 % of the game's volume");
             videoVolume.ValueChanged += VideoVolumeChanged;
+            fmvLabel = label; fmvLine = line; fmvHint = hint;
             rows.Controls.Add(label, 0, r); rows.Controls.Add(line, 1, r); ++r;
             rows.Controls.Add(hint, 1, r); ++r;
         }
@@ -139,30 +144,31 @@ internal sealed class PatchWindow : Form
         root.Controls.Add(status);
 
         // The about text on the left, the credits on the right (same row, so the window stays short).
-        var footer = new TableLayoutPanel { Name = "FooterTable", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, RowCount = 1, Margin = new Padding(0, 0, 0, m) };
+        var footer = footerTable = new TableLayoutPanel { Name = "FooterTable", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, RowCount = 1, Margin = new Padding(0, 0, 0, m) };
         footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         footer.Controls.Add(new Label { Name = "AboutLabel", Text = "Road Rash™: 30th Anniversary Edition - fixes, widescreen and a Direct3D renderer. MultiFix loads through ddraw.dll; RoadRash95.exe is never modified.",
             AutoSize = true, MaximumSize = new Size(wrap * 2 / 5, 0), ForeColor = SystemColors.GrayText, Margin = new Padding(0, 0, m * 3, 0), Anchor = AnchorStyles.Top | AnchorStyles.Left }, 0, 0);
+        aboutLabel = footer.GetControlFromPosition(0, 0);
 
-        // Credits: two columns, heading above the names.
-        var credits = new TableLayoutPanel { Name = "AuthorsTable", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, Anchor = AnchorStyles.Top | AnchorStyles.Left, Margin = new Padding(0) };
-        credits.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); credits.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        credits.Controls.Add(new Label { Text = "Authors", AutoSize = true, Margin = new Padding(0, 0, m * 3, rg) }, 0, 0);
-        credits.Controls.Add(new Label { Text = "Contributions", AutoSize = true, Margin = new Padding(0, 0, 0, rg) }, 1, 0);
-        credits.Controls.Add(new Label { Name = "AuthorsLabel", Text = "MultiFix: magoowa  |  HD-Widescreen: OBLPlife  |  Netplay: Oldkid.net", AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(0, 0, m * 3, 0) }, 0, 1);
-        credits.Controls.Add(new Label { Name = "ContributionsLabel", Text = "Anakin94, peemosa, neparij", AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(0) }, 1, 1);
-        footer.Controls.Add(credits, 1, 0);
+        // Credits: one column, each heading with its names on one line under it (Authors, then Contributions).
+        var credits = new TableLayoutPanel { Name = "AuthorsTable", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, Anchor = AnchorStyles.Top | AnchorStyles.Left, Margin = new Padding(0) };
+        credits.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        credits.Controls.Add(new Label { Text = "Authors", AutoSize = true, Margin = new Padding(0, 0, 0, rg) }, 0, 0);
+        credits.Controls.Add(new Label { Name = "AuthorsLabel", Text = "MultiFix: magoowa  |  HD-Widescreen: OBLPlife  |  Netplay: Oldkid.net  |  DualSense: CypherCripto", AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(0, 0, 0, rg * 3) }, 0, 1);
+        credits.Controls.Add(new Label { Text = "Contributions", AutoSize = true, Margin = new Padding(0, 0, 0, rg) }, 0, 2);
+        credits.Controls.Add(new Label { Name = "ContributionsLabel", Text = "Anakin94, peemosa, neparij, jmb20, ChilliChickenDry", AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(0) }, 0, 3);
+        footer.Controls.Add(credits, 1, 0); creditsTable = credits;
         root.Controls.Add(footer);
         // Only the info block at the top (installations, executable, MultiFix, language, netplay) is lined up: it starts on the
         // column of the option descriptions, so the first column of the top block is as wide as the option names.
         EventHandler alignHead = delegate
         {
             var widths = rows.GetColumnWidths();
-            if (widths.Length > 0 && (int)head.ColumnStyles[0].Width != widths[0]) head.ColumnStyles[0].Width = widths[0];
+            if (!compact && widths.Length > 0 && (int)head.ColumnStyles[0].Width != widths[0]) head.ColumnStyles[0].Width = widths[0];
         };
         rows.SizeChanged += alignHead; rows.Layout += delegate { alignHead(null, EventArgs.Empty); };
 
-        var buttons = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Dock = DockStyle.Fill };
+        var buttons = buttonRow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Dock = DockStyle.Fill };
         Button[] all = { play, install, restore, new Button { Name = "CloseButton", Text = "Close", DialogResult = DialogResult.Cancel } };
         play.Name = "PlayButton"; play.Text = "Play";
         install.Name = "InstallButton"; install.Text = "Install / Update";
@@ -213,6 +219,15 @@ internal sealed class PatchWindow : Form
         Activated += delegate { if (!string.IsNullOrEmpty(path.Text)) { LoadOptions(path.Text); RefreshInfo(); } };
         if (installs.Items.Count > 0) installs.SelectedIndex = 0;
         RefreshInfo();
+        // A screen that is too narrow for the two-column layout (low resolution, or a big display scale on a small screen): one column.
+        {
+            Rectangle area = WorkingAreaOverride ?? Screen.FromPoint(Cursor.Position).WorkingArea;
+            Size chrome = SizeFromClientSize(Size.Empty);
+            root.PerformLayout();
+            if (root.GetPreferredSize(Size.Empty).Width + SystemInformation.VerticalScrollBarWidth > area.Width - chrome.Width)
+                SetCompact(area.Width - chrome.Width - SystemInformation.VerticalScrollBarWidth);
+            if (compact) RefreshInfo();        // the info lines were built with the wide-layout limits
+        }
         FitToScreen(root, bar, scroll);     // last: the info table and the language row are filled in by now
         StartUpdateCheck();
     }
@@ -280,6 +295,57 @@ internal sealed class PatchWindow : Form
     // Tests: pretend the working area is this rectangle.
     internal static Rectangle? WorkingAreaOverride;
     // As large as the content needs, but never larger than the screen's working area; scroll bars take over beyond that.
+    // One column: every option is its name with the description under it, text wraps to the available width, the logo is small,
+    // the head, the footer and the buttons stack. The scroll area then only has to scroll vertically.
+    void SetCompact(int available)
+    {
+        compact = true;
+        int m = Margin12, rg = RowGap, text = Math.Max(Px(120), available - 2 * m);
+        infoWrap = Math.Max(Px(100), text - (Px(80) + m) - Px(110));
+        SuspendLayout();
+        rootPanel.MinimumSize = new Size(0, 0);
+        if (logoBox != null)
+        {
+            int w = Px(80); logoBox.Size = new Size(w, logoBox.Image.Height * w / logoBox.Image.Width); logoBox.Margin = new Padding(0, 0, m, 0);
+            headTable.ColumnStyles[0] = new ColumnStyle(SizeType.Absolute, w + m);
+        }
+        // the options: name, description under it
+        optionRows.SuspendLayout();
+        optionRows.Controls.Clear();
+        optionRows.RowStyles.Clear(); optionRows.ColumnStyles.Clear(); optionRows.ColumnCount = 1; optionRows.RowCount = 0;
+        optionRows.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        int r = 0, indent = Px(20);
+        for (int i = 0; i < boxes.Count; ++i)
+        {
+            boxes[i].Margin = new Padding(0, rg * 2, 0, 0);
+            optionHints[i].Margin = new Padding(indent, 0, 0, rg); optionHints[i].MaximumSize = new Size(text - indent, 0);
+            optionRows.Controls.Add(boxes[i], 0, r++);
+            optionRows.Controls.Add(optionHints[i], 0, r++);
+        }
+        if (fmvLabel != null)
+        {
+            fmvLabel.Margin = new Padding(Px(13), rg * 2, 0, 0); fmvHint.Margin = new Padding(indent, 0, 0, rg); fmvHint.MaximumSize = new Size(text - indent, 0);
+            fmvLine.Margin = new Padding(indent, 0, 0, 0);
+            optionRows.Controls.Add(fmvLabel, 0, r++);
+            optionRows.Controls.Add(fmvLine, 0, r++);
+            optionRows.Controls.Add(fmvHint, 0, r++);
+        }
+        installs.MaximumSize = new Size(Math.Max(Px(100), infoWrap - Px(70)), 0);
+        optionRows.ResumeLayout(true);
+        // info block: the language buttons wrap
+        languageRow.WrapContents = true; languageRow.MaximumSize = new Size(infoWrap, 0);
+        status.MaximumSize = new Size(text, 0);
+        // footer: about text above the credits
+        footerTable.Controls.Clear(); footerTable.ColumnStyles.Clear(); footerTable.ColumnCount = 1; footerTable.RowCount = 2;
+        footerTable.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        aboutLabel.MaximumSize = new Size(text, 0); aboutLabel.Margin = new Padding(0, 0, 0, m);
+        footerTable.Controls.Add(aboutLabel, 0, 0); footerTable.Controls.Add(creditsTable, 0, 1);
+        foreach (Control c in creditsTable.Controls) c.MaximumSize = new Size(text, 0);   // the credits are one column already; long lines wrap
+        // the buttons wrap too
+        buttonRow.WrapContents = true; buttonRow.MaximumSize = new Size(text, 0);
+        ResumeLayout(true);
+    }
+
     void FitToScreen(Control root, Control bar, ScrollableControl scroll, bool recenter = true)
     {
         fitRoot = root; fitBar = bar; fitScroll = scroll;
@@ -388,7 +454,7 @@ internal sealed class PatchWindow : Form
     }
     void RefreshInfo()
     {
-        int m = Margin12, rg = RowGap, wrap = Px(520);
+        int m = Margin12, rg = RowGap, wrap = compact ? infoWrap : Px(520);
         infoTable.SuspendLayout();
         infoTable.Controls.Clear(); infoTable.RowStyles.Clear(); infoTable.RowCount = 0;
         Func<string, Label> key = text => new Label { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, rg, m, rg) };
@@ -431,7 +497,7 @@ internal sealed class PatchWindow : Form
         if (datecode != null) addRow("Netplay:", new Label { Name = "NetplayLabel", Text = "wsock32.dll present (datecode: " + datecode + ")", AutoSize = true });
         else
         {
-            var missing = new FlowLayoutPanel { Name = "NetplayPanel", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+            var missing = new FlowLayoutPanel { Name = "NetplayPanel", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, FlowDirection = FlowDirection.LeftToRight, WrapContents = compact, MaximumSize = compact ? new Size(wrap, 0) : Size.Empty };
             missing.Controls.Add(new Label { Text = "wsock32.dll not found -", AutoSize = true, Margin = new Padding(0, 0, rg * 2, 0) });
             var link = new LinkLabel { Name = "NetplayLink", Text = netplayBusy ? "downloading..." : "download netplay", AutoSize = true, Margin = new Padding(0), Enabled = !netplayBusy };
             link.LinkClicked += delegate { StartNetplayDownload(); };

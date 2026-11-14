@@ -70,8 +70,13 @@ internal static class Installer
         new PatchOption("Input", "KeyboardAndPad", true, "Keyboard + Controller Together", "Both work at the same time, whatever device the profile has selected"),
         new PatchOption("Input", "PadDialogs", true, "Controller Answers Dialogs", "A = OK / Yes and B = Cancel / No in the game's message boxes (for example when quitting)"),
         new PatchOption("Game", "FixBikeColors", true, "Fix Bike Colors", "The Rat and Super bikes have swapped colours in the race; they now match the showroom"),
+        new PatchOption("Game", "SpriteFixes", true, "Sprite Fixes", "Fixes the damaged punch shadow and lowers the buildings that hover above the ground (red barn, brown shop, white house)"),
         new PatchOption("Window", "AutoHideCursor", true, "Auto-Hide Mouse Cursor", "Hidden at start and after 3 s without mouse movement; returns when you move the mouse"),
         new PatchOption("Window", "StartFullscreen", true, "Start in Fullscreen", "Opens the game in borderless fullscreen"),
+        new PatchOption("Input", "DualSense", false, "DualSense Support (Exp.)", "Bluetooth reports and d-pad steering/menus for a DualSense or DualShock over HID (untested without the pad)"),
+        new PatchOption("Window", "DualMonitorUX", false, "Dual Monitor UX Improvements", "The mouse is not confined to the game window and the game does not minimize when you click another monitor"),
+        new PatchOption("Audio", "PedestrianVoiceRules", true, "New Pedestrian Voices", "Bystanders, bikers, cops and others shout with a chosen pool of voices; flag girls and people at the start react too"),
+        new PatchOption("Audio", "LouderPedestrians", true, "Louder Pedestrians", "Pedestrian voices and footsteps are no longer far quieter than the rider"),
         new PatchOption("Game", "SkipIntro", false, "Skip Intro Videos", "Skips the studio logos and the intro movie (menu music still starts)"),
     };
 
@@ -599,6 +604,9 @@ internal static class Installer
         for (int i = Managed.Length - 1; i >= 0; --i) Add(operations, Path.Combine(game.Root, Managed[i]), payload[i]);
         string ini = Path.Combine(game.Root, IniName);
         if (!File.Exists(ini)) Add(operations, ini, Resource(IniName));
+        // The pedestrian voice table is created once; an existing (possibly edited) one is left alone.
+        string voices = Path.Combine(game.Root, "PedestrianVoices.ini");
+        if (!File.Exists(voices)) Add(operations, voices, Resource("PedestrianVoices.ini"));
         return operations;
     }
     // The backup folder of earlier versions is not wanted any more.
@@ -670,7 +678,7 @@ internal static class Installer
             if (changed) Apply(operations);
             RemoveLegacyFolder(game);
             // Earlier versions called the renderer RoadRashHD.dll; the proxy no longer loads it.
-            try { string legacy = Path.Combine(game.Root, "RoadRashHD.dll"); if (File.Exists(legacy)) File.Delete(legacy); } catch (Exception) { }
+            try { string legacy = Path.Combine(game.Root, "RoadRashHD.dll"); if (File.Exists(legacy)) { byte[] old = File.ReadAllBytes(legacy); if (IsOurRenderer(old) || Contains(old, "RoadRashHD")) File.Delete(legacy); } } catch (Exception) { }
             if (!restore) { MergeMissingIniKeys(game); WriteOptions(game, options ?? new Dictionary<string, bool>()); }
             if (!changed)
                 return Finish(game, restore ? "The game is already in its pre-install state." : "This version of MultiFix is already installed. Settings were updated.", false);

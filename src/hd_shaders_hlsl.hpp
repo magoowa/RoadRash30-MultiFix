@@ -11,7 +11,7 @@ cbuffer Frame : register(b0) {
     int horizonW, horizonRows, horizonScroll, horizonY;
     float uiScale, uiOx, uiOy, uiFlat;
     float uiX0, uiX1, uiY0, uiY1;
-    float backdropFilter, presentW, presentH, padC;
+    float backdropFilter, presentW, presentH, horizonFrac;
     float presentX, presentY, padD, padE;
 };
 struct Quad { float4 px; float4 py; float4 pu; float4 pv; uint4 info; };
@@ -56,6 +56,9 @@ float4 PSBackdrop(float4 pos : SV_Position) : SV_Target {
         return pal(backdropIndex(int(floor(fx)), int(floor(fy))));
     // Bilinear sky / panorama (texture filtering also covers the backdrop)
     float sx = fx - 0.5, sy = fy - 0.5;
+    // the panorama rows scroll by a fractional number of pixels (the game rounds the scroll to whole pixels)
+    int rowHy = clamp(int(floor(fy)), 0, 479) - horizonY;
+    if (horizonRows > 0 && rowHy >= 0 && rowHy < horizonRows) sx -= horizonFrac;
     int ix = int(floor(sx)), iy = int(floor(sy));
     float wx = sx - ix, wy = sy - iy;
     float3 c00 = pal(backdropIndex(ix, iy)).rgb, c10 = pal(backdropIndex(ix + 1, iy)).rgb;
@@ -176,7 +179,7 @@ float4 PSQuad(QOut i) : SV_Target {
     bool transparent = (flags & 1u) != 0, useFrame = (flags & 8u) != 0;
     int tx = clamp(int(u), 0, tw - 1), ty = clamp(int(v), 0, th - 1);
     uint idx = texel(useFrame, ax + tx, ay0 + ty);
-    if (transparent && idx == 0) discard;            // nearest decides coverage (as on the CPU)
+    if (transparent && idx == 0) discard;   // nearest decides coverage (as on the CPU)
     if ((flags & 18u) == 0) return float4(pal(idx).rgb, qa);   // texture filtering off: plain nearest
     // Footprint of one output pixel in texels. Where a texture is squeezed (road and water towards the
     // horizon, far objects) one nearest/bilinear sample per pixel skips texels and shimmers or streaks, so
@@ -198,12 +201,12 @@ float4 PSQuad(QOut i) : SV_Target {
             float4 s = bilinearAt(u + d.x * t, v + d.y * t, ax, ay0, tw, th, useFrame, transparent);
             sum += s.rgb * s.a; wsum += s.a;
         }
-        if (wsum <= 0) return float4(pal(idx).rgb, qa);
+        if (wsum <= 0) { return float4(pal(idx).rgb, qa); }
         return float4(sum / wsum, qa);
     }
     if ((flags & 2u) == 0) return float4(pal(idx).rgb, qa);
     float4 b = bilinearAt(u, v, ax, ay0, tw, th, useFrame, transparent);
-    if (b.a <= 0) return float4(pal(0).rgb, qa);
+    if (b.a <= 0) { return float4(pal(0).rgb, qa); }
     return float4(b.rgb, qa);
 }
 

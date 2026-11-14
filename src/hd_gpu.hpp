@@ -46,7 +46,7 @@ struct GpuFrameInfo {       // constant buffer (b0), 16-byte multiples
     int32_t horizonW, horizonRows, horizonScroll, horizonY;
     float uiScale, uiOx, uiOy, uiFlat;
     float uiX0, uiX1, uiY0, uiY1;      // fitted 640x480 area in output pixels
-    float backdropFilter, presentW, presentH, padC; // backdropFilter: 1 = bilinear sky/backdrop; presentW/H: size of the area the scene is stretched over while presenting
+    float backdropFilter, presentW, presentH, horizonFrac; // backdropFilter: 1 = bilinear sky/backdrop; presentW/H: size of the area the scene is stretched over while presenting; horizonFrac: fractional part of the panorama scroll in the game's pixels
     float presentX, presentY, padD, padE;           // top-left of that area in back-buffer pixels
 };
 
@@ -59,6 +59,7 @@ public:
     // true: the swap chain lives on a child window of the game window (Windows: keeps the DWM from holding on to the
     // last flip-model frame). false: the swap chain is created on the game window itself (the usual path under Wine/Proton).
     bool useChildWindow = true;
+    bool usedChildWindow = true;      // how the current swap chain was created (useChildWindow may be read later)
     bool failed = false;
     // Low-latency presentation (set before init): a waitable swap chain with at most one queued frame, and
     // tearing presents when VSync is off (no compositor copy wait). Both fall back silently when unsupported.
@@ -82,7 +83,24 @@ public:
         closeWaitable();
         if (ctx) ctx->Flush();              // make sure DXGI really destroyed the swap chain first
         if (child) { DestroyWindow(child); child = nullptr; }
-        if (window && IsWindow(window)) InvalidateRect(window, nullptr, FALSE);   // let the game repaint what it drew with GDI
+        if (window && IsWindow(window)) {
+            InvalidateRect(window, nullptr, FALSE);   // let the game repaint what it drew with GDI
+            if (!usedChildWindow) {
+                // The swap chain lived on the game window itself (ChildSurface=0): Windows keeps showing its last frame until the
+                // window's composition surface is rebuilt, so the menu would stay frozen on the last race picture. Rebuild it:
+                // redraw everything, re-apply the frame, and move the size by one pixel and back (no activation, no content copy).
+                RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
+                const UINT quiet = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOCOPYBITS;
+                SetWindowPos(window, nullptr, 0, 0, 0, 0, quiet | SWP_NOSIZE | SWP_FRAMECHANGED);
+                RECT r{}; GetWindowRect(window, &r);
+                if (r.right > r.left && r.bottom > r.top && !IsIconic(window)) {
+                    SetWindowPos(window, nullptr, 0, 0, r.right - r.left + 1, r.bottom - r.top, quiet);
+                    SetWindowPos(window, nullptr, 0, 0, r.right - r.left, r.bottom - r.top, quiet);
+                }
+                RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+                if (log) log("swap chain released from the game window: window surface rebuilt");
+            }
+        }
         window = nullptr;
     }
 
@@ -154,6 +172,7 @@ public:
         // The swap chain lives on its own child window that covers the game window and is destroyed when the
         // race ends: the game window itself never gets a flip-model chain, so whatever GDI drew there reappears.
         HWND target = hwnd;
+        usedChildWindow = useChildWindow;
         if (useChildWindow) {
             static ATOM cls = 0;
             if (!cls) {
@@ -423,6 +442,13 @@ public:
         timingEnd();
         HRESULT hr = swap->Present(syncInterval, (syncInterval == 0 && tearingOk) ? DXGI_PRESENT_ALLOW_TEARING : 0);
         if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) return fail("device lost", hr);
+        // DXGI_STATUS_OCCLUDED and the like are not errors (the window is hidden); anything else that failed is reported, not hidden.
+        if (FAILED(hr)) {   // this frame is not shown (the caller falls back for it); the renderer stays on, the first few are logged
+            if (presentFailures++ < 5) {
+                char msg[160]; std::snprintf(msg, sizeof msg, "Present failed (hr=0x%08lx), frame skipped", static_cast<unsigned long>(hr)); say(msg);
+            }
+            return false;
+        }
         return true;
     }
 
@@ -493,6 +519,7 @@ private:
 
     template<class T> static void rel(T*& p) { if (p) { p->Release(); p = nullptr; } }
     void say(const char* m) { if (log) log(m); }
+    int presentFailures = 0;
     bool fail(const char* m, HRESULT hr = S_OK) {
         char msg[256]; std::snprintf(msg, sizeof msg, "Direct3D renderer disabled: %s (hr=0x%08lx)", m, static_cast<unsigned long>(hr));
         say(msg); failed = true; return false;

@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.18.0
+
+**Sound**
+- **New pedestrian voices and collision sounds** (`[Audio] PedestrianVoiceRules`, on by default, launcher option): every kind of pedestrian shouts with its own pool of voices, one drawn at random for the first and the second reaction (table in `PedestrianVoices.ini`, which you can edit). The flag girls and the people standing at the start react to a collision as well, a woman who had no voice in the game's data now has one (`FemaleVoiceFallback`), and two first reactions keep at least 120 ms apart (`PedestrianVoiceGapMs`) so a fight is not a chorus.
+- **Louder pedestrians** (`[Audio] LouderPedestrians`, `PedestrianGainDb`, `PedestrianVolumeRelief`, `PedestrianVoiceRelief`; launcher option): the game plays pedestrian voices and footsteps at a fixed -17.6 dB, far below the rider. They are louder now (louder copies are made once in `%LOCALAPPDATA%\RoadRashMultiFix\audio`; the game's own files are never changed) and the voices are no longer drowned by the crash and grunt.
+
+**Picture**
+- **Sprite fixes** (`[Game] SpriteFixes`, on by default, launcher option): the damaged shadow of the first punch frame (drawn far from the bike in the original game) is cut to its real size, and the buildings that hovered above the ground (red barn, brown wooden shop, white house) are lowered (`LowerRedBarn`, `LowerBrownShop`, `LowerWhiteHouse`). Only the drawing changes, in memory.
+
+**Controllers and window**
+- **A native DualSense no longer scrolls the menus by itself** (always on): the game opened every HID interface of the pad, including ones that are not a game pad; only game pad and joystick interfaces are opened now. Found by CypherCripto (issue #4).
+- **DualSense support** (`[Input] DualSense`, off by default, launcher option): Bluetooth reports and d-pad steering and menus, diagonals too. Written from the report and checked against the game code; not tested without a DualSense. Skipping the intro videos with a pad that is not an XInput one (DualSense, DualShock) works too.
+- **Analog throttle on the right trigger** (`[Input] AnalogThrottle` and `Throttle*`): the throttle follows the pressure of the trigger, so slow speeds can be held.
+- **Back to the game with the pad** (always on): after Alt+Tab or a click on another monitor the game stays in the background and only the keyboard or mouse could bring it back. While the game is not the active window, Start + Back on an Xbox pad restores it and takes the focus; nothing changes while you play.
+- **Dual monitor UX improvements** (`[Window] DualMonitorUX`, off by default, launcher option): the mouse is not confined to the game window and the game is not minimized when you click another monitor.
+
+**Proton, Wine and Linux** (no switches, always on)
+- The `ddraw.dll` proxy loads the system ddraw once and thread-safely, finds its functions by name (Wine's ordinals differ), ends a missing export in a safe failure and writes nothing in `DllMain`; under Wine it writes `RoadRashHD_proxy.log`. This fixes the crash reported after the first `DirectDrawCreate` (to be confirmed on Wine).
+- `linux/install.sh`: `--remove` and `--overwrite-ini` work in any position, `--remove` never deletes a `ddraw.dll` that is not ours, a foreign `ddraw.dll` is never overwritten when an older backup exists, and a failing dialog tool no longer changes the exit code.
+
+**Other**
+- **The `ddraw.dll` proxy (the DirectDraw loader) was made safer.** MultiFix reaches the game through a small `ddraw.dll` placed next to `RoadRash95.exe`: the game loads it instead of the system one, it starts MultiFix and forwards every DirectDraw call to the real system `ddraw.dll`. The review of 2.18.0 found weak spots in that forwarding, which matter most under Proton, Wine and CrossOver (and are harmless on Windows): the real `ddraw.dll` is now loaded exactly once and thread-safely, so a second thread can no longer jump through a half-filled table; its functions are found by name, because Wine's ordinal numbers differ from Windows'; an export that the real `ddraw.dll` does not have ends in a safe error instead of a jump to address zero; and nothing is written to a file while the DLL loads (Windows holds a lock then). A new test calls the proxy from 16 threads at once (`hd_proxy_threads_test`).
+- **If something goes wrong, please send the logs.** `RoadRashHD.log` (next to the game) is written by MultiFix at every start: it lists what was patched and why something was skipped. If it does not appear at all, MultiFix was not loaded (under Proton the launch option `WINEDLLOVERRIDES="ddraw=n,b" %command%` is required). Under Wine, Proton and CrossOver the proxy also writes `RoadRashHD_proxy.log`, which shows how the real `ddraw.dll` was found. `[Debug] Profile=1` adds frame-time statistics, `QuadDiagnostics=1` saves frames with picture glitches as `RoadRashHD_glitch_N.bmp`, and `[Graphics] D3D11=0` switches to the CPU renderer to tell a Direct3D problem from another one. Attach both logs, `RoadRashHD.ini` and your system (Windows version, or Proton / Wine / CrossOver version) to the report.
+- A failed Direct3D `Present` (other than device loss, which already switched the renderer off) is now written to the log and that frame is skipped, instead of being treated as success; this makes problems under DXVK visible in `RoadRashHD.log`.
+- All logs and troubleshooting keys are in one `[Debug]` section (`Profile`, `DumpFrameEverySeconds`, `DumpScale`, `QuadDiagnostics`, `CompareGpu`, `KeyScript`); old values in `[Graphics]` are still read.
+
 ## 2.17.3
 
 - **Keyboard + Controller Together** (`[Input] KeyboardAndPad`, launcher option, on by default): the game read only the control device saved in the profile, so a profile set to the keyboard ignored the pad in a race. Both are read now, and missing pad assignments of a keyboard profile are filled in with the game's defaults.

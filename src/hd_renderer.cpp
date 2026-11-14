@@ -7,6 +7,10 @@
 #include <audioclient.h>
 #include <audiopolicy.h>
 #include <vector>
+#include <cmath>
+#include <mmsystem.h>
+#include <dsound.h>
+#include <map>
 #include <string>
 #include <cstdio>
 #include <intrin.h>
@@ -133,11 +137,50 @@ DWORD (WINAPI* xinputGetState())(DWORD,void*) {
         if(module){function=reinterpret_cast<DWORD(WINAPI*)(DWORD,void*)>(GetProcAddress(module,"XInputGetState"));if(function)break;}}}
     return function;
 }
+// Speed governor for the right trigger ([Input] ThrottleMode=Speed). In this game the right trigger is a button, so a light touch cannot be
+// analog. The trigger is turned into a target speed (top speed * t^curve, t from ThrottleThreshold to full) and the game is told that the trigger
+// is "pressed" (255) or "released" (0) in the share of the polls that a PI controller asks for (pulse density), so the speed settles on the target
+// instead of swinging around it. The bike then holds a slow, steady speed for a light touch; the digital trigger, the keyboard and the other
+// controls are not changed.
+bool throttleGovernor=true;double governorCurve=0.5,governorTopSpeed=4500,governorBaseDuty=0.36;int governorThreshold=3;
+bool readInt(const void* address,int* value);
+int playerSpeed();
 volatile LONG padBlock=0;
+volatile LONG padRightTrigger=0;   // the pressure (0-255) of the right trigger in the game's last XInput read; used by the analog throttle
 DWORD (WINAPI* originalXInputGetState)(DWORD,void*)=nullptr;
 DWORD WINAPI xinputGetStateHook(DWORD user,void* state) {
-    if(padBlock){if(state)std::memset(state,0,16);return 0;}   // XINPUT_STATE is 16 bytes; 0 = ERROR_SUCCESS
-    return originalXInputGetState(user,state);
+    if(padBlock){if(state)std::memset(state,0,16);padRightTrigger=0;return 0;}   // XINPUT_STATE is 16 bytes; 0 = ERROR_SUCCESS
+    DWORD result=originalXInputGetState(user,state);
+    if(result==0 && state) {
+        uint8_t* bytes=static_cast<uint8_t*>(state);
+        padRightTrigger=bytes[7];   // XINPUT_STATE: packet (4), buttons (2), left trigger, right trigger
+        if(throttleGovernor && bytes[7]>=governorThreshold) {
+            static double integral=0,accumulator=0;static LONGLONG lastCall=0;
+            int speed=playerSpeed();
+            if(speed>=0) {
+                LARGE_INTEGER now,frequency;QueryPerformanceCounter(&now);QueryPerformanceFrequency(&frequency);
+                double dt=lastCall?double(now.QuadPart-lastCall)/double(frequency.QuadPart):1.0/60.0;lastCall=now.QuadPart;
+                dt=std::min(dt,0.05);
+                double t=std::min(1.0,(bytes[7]-governorThreshold)/double(255-governorThreshold));
+                bool pressed;
+                if(t>=0.97){pressed=true;integral=0;accumulator=0;}
+                else {
+                    // PI controller with a pulse-density output: the wanted share of the time the throttle is on (duty) is the base share plus a part
+                    // proportional to the speed error and a part that accumulates it; the button is pressed in exactly that share of the polls.
+                    double target=governorTopSpeed*std::pow(t,governorCurve),error=target-speed;
+                    integral=std::max(-0.4,std::min(0.6,integral+error*dt/7000.0));
+                    double duty=std::max(0.0,std::min(1.0,governorBaseDuty+error/700.0+integral));
+                    accumulator+=duty;
+                    pressed=accumulator>=1.0;
+                    if(pressed)accumulator-=1.0;
+                }
+                bytes[7]=pressed?255:0;
+            }
+        } else if(throttleGovernor) {
+            // trigger released: the controller starts again from scratch next time
+        }
+    }
+    return result;
 }
 int __cdecl resolutionMenuHook() {
     static bool open=false;static DWORD closedAt=0;
@@ -422,9 +465,43 @@ LRESULT CALLBACK renderWindowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) 
     if(message==WM_NCDESTROY){hookedWindow=nullptr;previousWindowProc=nullptr;completedFrame=false;}
     return result;
 }
+// Bringing the game back with the pad ([Input] PadRestore). After Alt+Tab (or a click on another monitor) the game sits in the background, often
+// minimized, and no pad button reaches it, so the keyboard or mouse was needed to return. While the game is not the active application (the
+// game's own flag 0x5a2928 is 0), this thread watches the first XInput pad (XInput works without focus); Start + Back pressed together restores the
+// window and takes the focus. It does nothing while the game is active, so no game control is changed.
+void bringGameToFront(HWND window) {
+    if(IsIconic(window))ShowWindow(window,SW_RESTORE);
+    HWND foreground=GetForegroundWindow();
+    DWORD foregroundThread=foreground?GetWindowThreadProcessId(foreground,nullptr):0,thisThread=GetCurrentThreadId();
+    bool attached=foregroundThread && foregroundThread!=thisThread && AttachThreadInput(thisThread,foregroundThread,TRUE);
+    keybd_event(VK_MENU,0,0,0);keybd_event(VK_MENU,0,KEYEVENTF_KEYUP,0);   // lets SetForegroundWindow through the foreground lock
+    BringWindowToTop(window);SetForegroundWindow(window);
+    SwitchToThisWindow(window,TRUE);   // works where SetForegroundWindow is refused
+    if(attached)AttachThreadInput(thisThread,foregroundThread,FALSE);
+}
+DWORD WINAPI padRestoreThread(LPVOID) {
+    auto getState=xinputGetState();if(!getState)return 0;
+    const WORD combo=0x0010|0x0020;   // Start | Back
+    bool wasDown=true;int attempts=0;
+    for(;;) {
+        Sleep(80);
+        HWND window=hookedWindow;
+        if(!window || at<uint8_t>(0x5a2928)){wasDown=true;attempts=0;continue;}   // active: nothing to do (and a combo held on the way out must be released first)
+        XInputPad pad{};
+        bool down=getState(0,&pad)==0 && (pad.buttons&combo)==combo;
+        if(!down){wasDown=false;attempts=0;continue;}
+        // pressed: bring the window back; if the game is still not active a moment later (focus lock), try again while the buttons are held
+        if(!wasDown || (++attempts%5==0 && attempts<=25)) {
+            bringGameToFront(window);
+            if(!wasDown)status("pad: Start + Back pressed while the game was in the background, window brought to the front");
+        }
+        wasDown=true;
+    }
+}
 void logWindow(HWND window);
 void hookWindow(HWND window) {
     themeThread();
+    {static bool started=false;if(!started && window){started=true;HANDLE h=CreateThread(nullptr,0,padRestoreThread,nullptr,0,nullptr);if(h)CloseHandle(h);}}
     {static bool started=false;if(!started && window){started=true;HANDLE h=CreateThread(nullptr,0,hotkeyThread,nullptr,0,nullptr);if(h)CloseHandle(h);}}
     if(!window || hookedWindow==window)return;
     auto previous=reinterpret_cast<WNDPROC>(SetWindowLongPtrA(window,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(&renderWindowProc)));
@@ -471,9 +548,109 @@ std::vector<RasterJob> rasterJobs,frameJobs;
 bool cpuWorld=false;
 void ensureCpuWorld();
 std::vector<uint8_t> textureSnapshots;
+// Buildings that float above the ground (original game): the sprites of the red barn (BARN12) and of the brown wooden shop with the sign
+// (RUSTICA2) and the white house (HOUSEB2) have transparent rows at their bottom edge, so they hover. Every quad whose texture is one of these (all mip levels; found by
+// size and a hash of the row sums of twelve rows of the pixels, taken from the game's own FAMILIES.RSC) is moved down by N rows of the full
+// size texture: BARN12 by 2, RUSTICA2 by 3 ([Game] SpriteFixes). Only the drawing changes; the game's data and collisions stay.
+struct SceneryFix{const char* name;int width,height;uint32_t hash;int shift;int baseHeight;};
+const SceneryFix sceneryFixes[]={
+    {"BARN12",32,16,0x14883c18u,0,131},
+    {"BARN12",32,17,0x14883c18u,0,131},
+    {"BARN12",32,18,0x9c0a4b12u,0,131},
+    {"BARN12",64,32,0x1c6405ddu,0,131},
+    {"BARN12",64,33,0x1c6405ddu,0,131},
+    {"BARN12",64,34,0x00eef8c6u,0,131},
+    {"BARN12",128,65,0xd92cedbcu,0,131},
+    {"BARN12",128,66,0xd21262a9u,0,131},
+    {"BARN12",128,67,0x7b13861du,0,131},
+    {"BARN12",256,130,0x932ff8e1u,0,131},
+    {"BARN12",256,131,0x73098615u,0,131},
+    {"BARN12",256,132,0x835fce15u,0,131},
+    {"HOUSEB2",32,16,0xf73bfaa3u,2,132},
+    {"HOUSEB2",32,17,0xf73bfaa3u,2,132},
+    {"HOUSEB2",32,18,0x8d89c2a1u,2,132},
+    {"HOUSEB2",64,32,0xe8313c12u,2,132},
+    {"HOUSEB2",64,33,0xe8313c12u,2,132},
+    {"HOUSEB2",64,34,0xf2470877u,2,132},
+    {"HOUSEB2",128,65,0xc92d53c6u,2,132},
+    {"HOUSEB2",128,66,0x007ac483u,2,132},
+    {"HOUSEB2",128,67,0xc6287e57u,2,132},
+    {"HOUSEB2",256,131,0x0e1cabd5u,2,132},
+    {"HOUSEB2",256,132,0xa804f205u,2,132},
+    {"HOUSEB2",256,133,0xa804f205u,2,132},
+    {"RUSTICA2",32,14,0x63c64932u,1,115},
+    {"RUSTICA2",32,15,0x991605bcu,1,115},
+    {"RUSTICA2",32,16,0x7d4ee838u,1,115},
+    {"RUSTICA2",64,28,0x5c4a0474u,1,115},
+    {"RUSTICA2",64,29,0x5c4a0474u,1,115},
+    {"RUSTICA2",64,30,0x77bef442u,1,115},
+    {"RUSTICA2",128,57,0xf7bdb5a0u,1,115},
+    {"RUSTICA2",128,58,0x285dd9d2u,1,115},
+    {"RUSTICA2",128,59,0xe81dfacfu,1,115},
+    {"RUSTICA2",256,114,0x5d5eef49u,1,115},
+    {"RUSTICA2",256,115,0x9c7ffa00u,1,115},
+    {"RUSTICA2",256,116,0x7e2bfc87u,1,115},
+};
+bool fixFloatingBuildings=true;
+double lowerRows[3]={2.0,3.0,10.0};   // [Game] LowerRedBarn / LowerBrownShop / LowerWhiteHouse: rows of the full-size picture (table column "shift" = index)
+// The game keeps these textures rotated sideways (a cyclic shift of every row), so the hash uses the sum of every row: rows h/4, h/2
+// and 3h/4, four each, which does not change under such a rotation.
+uint32_t sceneryHash(const uint8_t* pixels,int width,int height) {
+    uint32_t hash=2166136261u;
+    for(int g:{height/4,height/2,(height*3)/4})
+        for(int y=g;y<g+4 && y<height;++y) {
+            uint32_t sum=0;
+            for(int x=0;x<width;++x)sum+=pixels[size_t(y)*width+x];
+            for(int k=0;k<4;++k)hash=(hash^((sum>>(8*k))&255u))*16777619u;
+        }
+    return hash;
+}
+void lowerFloatingBuilding(RasterJob& job) {
+    const Texture& t=job.texture;
+    if(!t.pixels || t.width<32 || t.height<16)return;
+    const SceneryFix* match=nullptr;
+    for(const auto& f:sceneryFixes) {
+        if(f.width!=t.width || f.height!=t.height)continue;
+        if(!match) {   // hash once, for the first entry of this size
+            uint32_t h=sceneryHash(t.pixels,t.width,t.height);
+            for(const auto& g:sceneryFixes)if(g.width==t.width && g.height==t.height && g.hash==h){match=&g;break;}
+            break;
+        }
+    }
+    static bool sizeSeen[64]{},loggedMatch[3]{};
+    if(!match) {   // a texture of the right size whose pixels differ: say so once (the game's memory may differ from its file)
+        for(size_t i=0;i<sizeof sceneryFixes/sizeof sceneryFixes[0];++i)
+            if(sceneryFixes[i].width==t.width && sceneryFixes[i].height==t.height && !sizeSeen[i]) {
+                sizeSeen[i]=true;
+                char m[200];std::snprintf(m,sizeof m,"floating buildings: a %dx%d texture has the size of %s but not its pixels (hash 0x%08x, expected 0x%08x)",t.width,t.height,sceneryFixes[i].name,
+                                          sceneryHash(t.pixels,t.width,t.height),sceneryFixes[i].hash);status(m);
+                // the full level-0 textures are written next to the log so they can be compared with the game's file
+                if(t.width==256 && (t.height==131 || t.height==115)) {
+                    std::wstring path=logPath.substr(0,logPath.find_last_of(L'\\')+1)+L"RoadRashHD_texture_"+std::to_wstring(t.width)+L"x"+std::to_wstring(t.height)+L".bin";
+                    FILE* f=nullptr;
+                    if(_wfopen_s(&f,path.c_str(),L"wb")==0 && f){fwrite(t.pixels,1,size_t(t.width)*t.height,f);fclose(f);}
+                }
+            }
+        return;
+    }
+    int which=match->shift;
+    if(!loggedMatch[which]){loggedMatch[which]=true;char m[120];std::snprintf(m,sizeof m,"floating buildings: %s found (%dx%d), drawn %.1f rows lower",match->name,t.width,t.height,lowerRows[match->shift]);status(m);}
+    double lo=job.points[0].y,hi=lo;
+    for(const auto& p:job.points){lo=std::min(lo,p.y);hi=std::max(hi,p.y);}
+    const double rows=lowerRows[match->shift];
+    double dy=rows*(hi-lo)/match->baseHeight;
+    for(auto& p:job.points)p.y+=dy;
+    if(job.hasLegacy) {
+        double llo=job.legacy[0].y,lhi=llo;
+        for(const auto& p:job.legacy){llo=std::min(llo,p.y);lhi=std::max(lhi,p.y);}
+        double ldy=rows*(lhi-llo)/match->baseHeight;
+        for(auto& p:job.legacy)p.y+=ldy;
+    }
+}
 void enqueueQuad(const Vertex (&points)[4],Texture texture,uint8_t color,bool changing=false,const Vertex* logical=nullptr) {
     RasterJob job{};std::memcpy(job.points,points,sizeof job.points);job.texture=texture;job.color=color;
     if(logical){for(int i=0;i<4;++i)job.legacy[i]={logical[i].x,logical[i].y,points[i].u,points[i].v};job.hasLegacy=true;}
+    if(fixFloatingBuildings)lowerFloatingBuilding(job);
     if(changing && texture.pixels) {
         double ul=points[0].u,ur=ul,vt=points[0].v,vb=vt;
         for(const auto& p:points){ul=std::min(ul,p.u);ur=std::max(ur,p.u);vt=std::min(vt,p.v);vb=std::max(vb,p.v);}
@@ -719,6 +896,12 @@ bool writeMemory(uintptr_t address,const void* bytes,size_t length) {
     std::memcpy(dest,bytes,length);FlushInstructionCache(GetCurrentProcess(),dest,length);
     DWORD ignored;VirtualProtect(dest,length,oldProtect,&ignored);return true;
 }
+// Log and troubleshooting keys all live in [Debug]; the old place ([Graphics], used by 2.17.3 for Profile) is still read when [Debug] has no value.
+UINT debugInt(const wchar_t* key,int def,const wchar_t* file) {
+    UINT value=GetPrivateProfileIntW(L"Debug",key,-12345,file);
+    if(int(value)!=-12345)return value;
+    return GetPrivateProfileIntW(L"Graphics",key,def,file);
+}
 bool branch(uintptr_t va,void* target,uint8_t opcode) {
     uint8_t code[5]={opcode};uint32_t rel=uint32_t(reinterpret_cast<uintptr_t>(target)-(base+va-0x400000+5));
     std::memcpy(code+1,&rel,4);return writeMemory(base+va-0x400000,code,sizeof code);
@@ -864,8 +1047,18 @@ int __fastcall horizonLoadHook(const char* path) {
     if(gpu.ready())gpu.flushTextures();
     return result;
 }
+// The game computes the horizontal scroll of the panorama (mountains, far trees) from a fixed-point heading (0x612838, 15 fractional bits, in the
+// 640x480 pixels) and rounds it to whole pixels, so the horizon moves in steps of one game pixel (several screen pixels) in a curve. The exact
+// value is read here; its fractional part is passed to the Direct3D back drop ([Graphics] SmoothHorizon).
+bool smoothHorizon=false;double horizonFraction=0;
 void __fastcall horizonDrawHook(int scroll,int y) {
-    horizonScroll=scroll;horizonY=y;fn<HorizonDraw>(0x469770)(scroll,y);
+    horizonScroll=scroll;horizonY=y;
+    horizonFraction=0;
+    if(smoothHorizon && at<uint8_t>(0x5a292a)) {
+        double exact=-double(at<int>(0x612838))/32768.0,fraction=exact-scroll;
+        if(fraction>-1.01 && fraction<1.01)horizonFraction=fraction;
+    }
+    fn<HorizonDraw>(0x469770)(scroll,y);
 }
 int wrap(int x,int n) { int r=x%n;return r<0?r+n:r; }
 void paintBackdrop(const uint8_t* pixels,int pitch) {
@@ -1236,8 +1429,52 @@ void __fastcall present16Hook(const void* pixels,int pitch,int r,int g,int b) {
 // ---- Direct3D present ---------------------------------------------------------------------
 // Builds the quad list from this frame's jobs, uploads textures, draws backdrop + quads + UI on the
 // GPU and presents. Returns false (and the caller falls back to GDI) if the device is unusable.
+// Diagnostics for picture glitches ([Graphics] QuadDiagnostics=1): the Direct3D renderer interpolates every quad in single precision
+// from the corner values the game computes. A quad with extreme corners (far outside the picture, not finite, or with huge texture
+// coordinates) can come out as streaks. Every such quad is written to the log (first 80) with its corners, texture size and flags,
+// and the frame it appears in is saved as RoadRashHD_glitch_N.bmp (full size, at most 8, at least 1 s apart).
+bool quadDiagnostics=false;
+int quadAnomalyLines=0,quadAnomalyFrames=0;
+bool anomalyInFrame=false;
+void checkQuad(const rrhd::GpuQuad& q,size_t index) {
+    float minX=1e30f,maxX=-1e30f,minY=1e30f,maxY=-1e30f,uv=0;bool finite=true;
+    for(int i=0;i<4;++i) {
+        if(!std::isfinite(q.x[i])||!std::isfinite(q.y[i])||!std::isfinite(q.u[i])||!std::isfinite(q.v[i])){finite=false;continue;}
+        minX=std::min(minX,q.x[i]);maxX=std::max(maxX,q.x[i]);minY=std::min(minY,q.y[i]);maxY=std::max(maxY,q.y[i]);
+        uv=std::max(uv,std::max(std::fabs(q.u[i]),std::fabs(q.v[i])));
+    }
+    const char* why=nullptr;
+    if(!finite)why="not finite";
+    else if(maxX-minX>6.0f*width || maxY-minY>6.0f*height)why="larger than six screens";
+    else if(std::max(std::max(std::fabs(minX),std::fabs(maxX)),std::max(std::fabs(minY),std::fabs(maxY)))>10.0f*std::max(width,height))why="corner far outside the picture";
+    else if(uv>1.0e6f)why="huge texture coordinate";
+    if(!why)return;
+    anomalyInFrame=true;
+    if(quadAnomalyLines>=80)return;
+    ++quadAnomalyLines;
+    char m[400];std::snprintf(m,sizeof m,"quad diagnostics: frame %llu quad %zu (%s): x[%.1f %.1f %.1f %.1f] y[%.1f %.1f %.1f %.1f] u[%.1f %.1f %.1f %.1f] v[%.1f %.1f %.1f %.1f] texture %ux%u flags 0x%x",
+                              (unsigned long long)frames,index,why,q.x[0],q.x[1],q.x[2],q.x[3],q.y[0],q.y[1],q.y[2],q.y[3],q.u[0],q.u[1],q.u[2],q.u[3],q.v[0],q.v[1],q.v[2],q.v[3],
+                              q.sizeWH&0xffffu,q.sizeWH>>16,q.flags);
+    status(m);
+}
+void saveGlitchFrame() {
+    static LONGLONG lastSave=0,freq=0;
+    if(!anomalyInFrame || quadAnomalyFrames>=8 || !gpu.ready())return;
+    LARGE_INTEGER now,f;QueryPerformanceCounter(&now);QueryPerformanceFrequency(&f);freq=f.QuadPart;
+    if(lastSave && now.QuadPart-lastSave<freq)return;
+    if(!gpu.readScene(gpuShot))return;
+    lastSave=now.QuadPart;
+    BITMAPFILEHEADER fh{};BITMAPINFOHEADER ih{};
+    ih.biSize=sizeof ih;ih.biWidth=width;ih.biHeight=-height;ih.biPlanes=1;ih.biBitCount=32;ih.biCompression=BI_RGB;
+    fh.bfType=0x4d42;fh.bfOffBits=sizeof fh+sizeof ih;fh.bfSize=fh.bfOffBits+DWORD(gpuShot.size()*4);
+    std::wstring path=logPath.substr(0,logPath.find_last_of(L'\\')+1)+L"RoadRashHD_glitch_"+std::to_wstring(quadAnomalyFrames)+L".bmp";
+    FILE* file=nullptr;
+    if(_wfopen_s(&file,path.c_str(),L"wb")==0 && file){fwrite(&fh,sizeof fh,1,file);fwrite(&ih,sizeof ih,1,file);fwrite(gpuShot.data(),4,gpuShot.size(),file);fclose(file);}
+    ++quadAnomalyFrames;
+    char m[160];std::snprintf(m,sizeof m,"quad diagnostics: frame %llu saved as RoadRashHD_glitch_%d.bmp",(unsigned long long)frames,quadAnomalyFrames-1);status(m);
+}
 bool gpuBuildQuads(std::vector<rrhd::GpuQuad>& quads) {
-    quads.clear();quads.reserve(frameJobs.size());
+    quads.clear();quads.reserve(frameJobs.size());anomalyInFrame=false;
     fixSnapshotPointers(frameJobs);
     for(const auto& job:frameJobs) {
         rrhd::GpuQuad q{};
@@ -1259,6 +1496,7 @@ bool gpuBuildQuads(std::vector<rrhd::GpuQuad>& quads) {
             q.flags=4;q.color=job.color;
         }
         q.flags|=255u<<8;   // opacity 255 = solid (the shader lowers it for quads thinner than a pixel row)
+        if(quadDiagnostics)checkQuad(q,quads.size());
         quads.push_back(q);
     }
     return true;
@@ -1316,6 +1554,7 @@ bool gpuPresent() {
     rrhd::GpuFrameInfo info{};
     info.viewW=float(width);info.viewH=float(height);info.sceneScale=float(sceneScale);info.halfW=float(width/2.0);
     info.horizonW=horizonWidth;info.horizonRows=horizonRows;info.horizonScroll=horizonScroll;info.horizonY=horizonY;
+    info.horizonFrac=float(horizonFraction);
     double ui=std::min(width/640.0,height/480.0);
     info.uiScale=float(ui);info.uiOx=float((width-640*ui)/2);info.uiOy=float((height-480*ui)/2);
     info.uiX0=float(uiX[0]);info.uiX1=float(uiX[640]);info.uiY0=float(uiY[0]);info.uiY1=float(uiY[480]);
@@ -1332,6 +1571,7 @@ bool gpuPresent() {
         }
         gpu.setLegacyBackdrop(legacyBackdrop.data());
         gpu.drawScene(info,quads.data(),quads.size());
+        if(quadDiagnostics)saveGlitchFrame();
         if(gpuCompare && gpu.readScene(gpuShot))gpuCompareWithCpu(gpuShot);
     } else {
         gpu.drawCpuFrame(rgba.data());
@@ -1526,17 +1766,35 @@ using PlayVideo=void(__fastcall*)(const char*,int,int);
 struct VideoSkipState{DWORD thread;volatile LONG done;};
 DWORD WINAPI videoSkipThread(LPVOID context) {
     auto* state=static_cast<VideoSkipState*>(context);
-    auto getState=xinputGetState();if(!getState)return 0;
+    auto getState=xinputGetState();
+    // A pad that is not an XInput one (a DualSense or DualShock over USB or Bluetooth) is read through the WinMM joystick API: any of its first 12 buttons skips.
+    struct JoyInfoEx{DWORD size,flags,x,y,z,r,u,v,buttons,buttonNumber,pov,reserved1,reserved2;};
+    typedef UINT(WINAPI* JoyGetPosEx)(UINT,JoyInfoEx*);
+    JoyGetPosEx joyGetPosEx=nullptr;
+    if(HMODULE mm=GetModuleHandleW(L"winmm.dll"))joyGetPosEx=reinterpret_cast<JoyGetPosEx>(GetProcAddress(mm,"joyGetPosEx"));
+    if(!getState && !joyGetPosEx)return 0;
     const WORD mask=0xf030;   // A B X Y Start Back
     WORD seenReleased=0,previous=mask;
+    DWORD joyPrevious=0xfff,joyReleased=0;
     while(!state->done) {
         Sleep(30);
-        XInputPad pad{};if(getState(0,&pad)!=0)continue;
-        WORD down=WORD(pad.buttons&mask);
-        seenReleased=WORD(seenReleased|(mask&~down));
-        WORD fresh=WORD(down&~previous&seenReleased);
-        previous=down;
-        if(fresh)PostThreadMessageA(state->thread,WM_KEYDOWN,VK_RETURN,0);
+        XInputPad pad{};
+        if(getState && getState(0,&pad)==0) {
+            WORD down=WORD(pad.buttons&mask);
+            seenReleased=WORD(seenReleased|(mask&~down));
+            WORD fresh=WORD(down&~previous&seenReleased);
+            previous=down;
+            if(fresh)PostThreadMessageA(state->thread,WM_KEYDOWN,VK_RETURN,0);
+        } else if(joyGetPosEx) {
+            JoyInfoEx info{};info.size=sizeof info;info.flags=0x80;   // JOY_RETURNBUTTONS
+            DWORD down=0;bool found=false;
+            for(UINT id=0;id<4 && !found;++id)if(joyGetPosEx(id,&info)==0){found=true;down=info.buttons&0xfff;}
+            if(!found)continue;
+            joyReleased|=~down&0xfff;
+            DWORD fresh=down&~joyPrevious&joyReleased;
+            joyPrevious=down;
+            if(fresh)PostThreadMessageA(state->thread,WM_KEYDOWN,VK_RETURN,0);
+        }
     }
     return 0;
 }
@@ -1564,6 +1822,813 @@ struct VideoVolumeScope {
         if(uninitialize)CoUninitialize();
     }
 };
+// Louder pedestrians ([Audio] LouderPedestrians, PedestrianGainDb). The voices and footsteps of pedestrians are barely heard
+// in a race (the footsteps are recorded about 14 dB below the average effect, several voices 6-9 dB). The game opens every
+// effect with mmioOpenA. For the pedestrian sounds the open is redirected to a louder copy (a soft limiter keeps the peaks
+// from clipping) kept in %LOCALAPPDATA%\RoadRashMultiFix\audio, made once from the game's own file, which is never changed;
+// anything that goes wrong falls back to the original file.
+CRITICAL_SECTION soundLock;std::string lastOpenedWav;bool soundWatch=true;
+bool quietEffects=true;double quietGainDb=3.0;
+CRITICAL_SECTION quietLock;
+std::unordered_map<std::string,std::string> quietDecision;   // lower-case file name -> file to open ("" = the original)
+using MmioOpenFn=HMMIO(WINAPI*)(LPSTR,LPMMIOINFO,DWORD);
+MmioOpenFn originalMmioOpen=nullptr;
+// The effects of people other than the rider: bystanders, bikers, tourists, skaters, cyclists, drivers, cops, the footsteps. The game
+// plays them at a fixed attenuation of about -17.6 dB (the log shows "volume -1761"), the rider's own grunts and crashes at 0 dB.
+bool isPedestrianSound(const std::string& key) {
+    static const char* const prefixes[]={"bkm","bkw","bsm","bsw","cm","cw","dm","fcyc","fg","fm","sk","tour","af","am","hf","jf","jm","ol","footstep"};
+    if(key.size()<5 || key.compare(key.size()-4,4,".wav")!=0 || key.compare(0,4,"skid")==0)return false;
+    if(key=="bounce.wav")return true;   // the thump of hitting a pedestrian or an object: also played at the fixed -17.6 dB
+    for(const char* p:prefixes)if(key.compare(0,std::strlen(p),p)==0)return true;
+    return false;
+}
+bool readWholeFile(const char* path,std::vector<uint8_t>& out) {
+    HANDLE f=CreateFileA(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(f==INVALID_HANDLE_VALUE)return false;
+    LARGE_INTEGER size{};
+    bool ok=GetFileSizeEx(f,&size) && size.QuadPart>44 && size.QuadPart<=(32<<20);
+    if(ok){out.resize(size_t(size.QuadPart));DWORD got=0;ok=ReadFile(f,out.data(),DWORD(out.size()),&got,nullptr) && got==out.size();}
+    CloseHandle(f);return ok;
+}
+// Returns the path of a louder copy for this file, or "" when the file is left as it is (or cannot be handled).
+std::string quietCopyFor(const char* path) {
+    const char* slash=std::strrchr(path,'\\');if(const char* other=std::strrchr(path,'/'))if(!slash || other>slash)slash=other;
+    std::string base=slash?slash+1:path,key=base;
+    for(auto& c:key)c=char(std::tolower(static_cast<unsigned char>(c)));
+    if(key.size()<5 || key.compare(key.size()-4,4,".wav")!=0 || !isPedestrianSound(key))return "";
+    EnterCriticalSection(&quietLock);
+    auto found=quietDecision.find(key);
+    if(found!=quietDecision.end()){std::string use=found->second;LeaveCriticalSection(&quietLock);return use;}
+    std::string use;
+    std::vector<uint8_t> bytes;
+    if(readWholeFile(path,bytes) && std::memcmp(bytes.data(),"RIFF",4)==0 && std::memcmp(bytes.data()+8,"WAVE",4)==0) {
+        size_t pos=12,dataAt=0,dataSize=0;bool pcm8=false;
+        while(pos+8<=bytes.size()) {
+            uint32_t size=*reinterpret_cast<uint32_t*>(&bytes[pos+4]);
+            if(std::memcmp(&bytes[pos],"fmt ",4)==0 && size>=16 && pos+8+16<=bytes.size())
+                pcm8=*reinterpret_cast<uint16_t*>(&bytes[pos+8])==1 && *reinterpret_cast<uint16_t*>(&bytes[pos+22])==8;
+            else if(std::memcmp(&bytes[pos],"data",4)==0){dataAt=pos+8;dataSize=std::min<size_t>(size,bytes.size()-dataAt);break;}
+            pos+=8+size+(size&1);
+        }
+        // the footsteps, recorded about 14 dB lower than the rest, get twice the configured gain
+        double gain=std::min(4.0,std::pow(10.0,quietGainDb/20.0)*(key=="footstep.wav"?2.0:1.0));
+        if(pcm8 && dataSize>=64 && gain>=1.1) {
+            double sum=0;
+            for(size_t i=0;i<dataSize;++i){double x=double(int(bytes[dataAt+i])-128);sum+=x*x;}
+            double rms=std::sqrt(sum/double(dataSize));
+            // a soft limiter keeps the peaks from clipping: small samples get the full gain, large ones are rounded off
+            for(size_t i=0;i<dataSize;++i) {
+                double x=double(int(bytes[dataAt+i])-128);
+                double y=127.0*std::tanh(gain*x/127.0);
+                bytes[dataAt+i]=uint8_t(std::max(0,std::min(255,int(std::lround(y))+128)));
+            }
+            char root[MAX_PATH]{};
+            DWORD n=GetEnvironmentVariableA("LOCALAPPDATA",root,sizeof root);
+            if(n>0 && n<MAX_PATH-64) {
+                std::string dir=std::string(root)+"\\RoadRashMultiFix";CreateDirectoryA(dir.c_str(),nullptr);
+                dir+="\\audio";CreateDirectoryA(dir.c_str(),nullptr);
+                std::string target=dir+"\\g"+std::to_string(int(quietGainDb*10))+"_"+base,temp=target+".tmp";
+                HANDLE f=CreateFileA(temp.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+                bool wrote=false;
+                if(f!=INVALID_HANDLE_VALUE){DWORD put=0;wrote=WriteFile(f,bytes.data(),DWORD(bytes.size()),&put,nullptr) && put==bytes.size();CloseHandle(f);}
+                if(wrote && MoveFileExA(temp.c_str(),target.c_str(),MOVEFILE_REPLACE_EXISTING)) {
+                    use=target;
+                    char m[160];std::snprintf(m,sizeof m,"audio: %s made louder (gain %.1f, RMS %.1f before)",base.c_str(),gain,rms);status(m);
+                } else DeleteFileA(temp.c_str());
+            }
+        }
+    }
+    quietDecision[key]=use;
+    LeaveCriticalSection(&quietLock);
+    return use;
+}
+HMMIO WINAPI mmioOpenHook(LPSTR name,LPMMIOINFO info,DWORD flags) {
+    if(soundWatch && name && !info) {
+        const char* slash=std::strrchr(name,'\\');if(const char* other=std::strrchr(name,'/'))if(!slash || other>slash)slash=other;
+        std::string base=slash?slash+1:name;
+        if(base.size()>4 && _stricmp(base.c_str()+base.size()-4,".wav")==0){EnterCriticalSection(&soundLock);lastOpenedWav=base;LeaveCriticalSection(&soundLock);}
+    }
+    if(quietEffects && name && !info && !(flags&(MMIO_WRITE|MMIO_READWRITE|MMIO_CREATE))) {
+        std::string louder=quietCopyFor(name);
+        if(!louder.empty()) {
+            std::vector<char> path(louder.begin(),louder.end());path.push_back(0);
+            HMMIO handle=originalMmioOpen(path.data(),info,flags);
+            if(handle)return handle;                // the copy could not be opened: fall back to the original file
+        }
+    }
+    return originalMmioOpen(name,info,flags);
+}
+// Sound diagnostics and volume relief for pedestrian sounds. The game loads every effect (mmioOpenA) and then creates a
+// DirectSound buffer for it, so the buffer can be matched with the file just opened. Play and SetVolume of those buffers
+// are logged (the first 400 events), which shows what the game does at a collision: whether the pedestrian sound is
+// played at all and with what volume (DirectSound volume is attenuation in 1/100 dB, 0 = full, -10000 = silent).
+// [Audio] PedestrianVolumeRelief (percent) reduces that attenuation for the pedestrian sounds (0 = as the game sets it).
+struct SoundInfo{std::string name;LONG volume=0;bool volumeSet=false;};
+std::unordered_map<void*,SoundInfo> soundBuffers;
+int soundLogged=0,pedestrianRelief=60,pedestrianVoiceRelief=100,pedestrianVoiceGapMs=120;bool femaleVoiceFallback=true;DWORD soundStart=GetTickCount();
+using CreateBufferFn=HRESULT(STDMETHODCALLTYPE*)(void*,const DSBUFFERDESC*,LPDIRECTSOUNDBUFFER*,IUnknown*);
+using DuplicateBufferFn=HRESULT(STDMETHODCALLTYPE*)(void*,LPDIRECTSOUNDBUFFER,LPDIRECTSOUNDBUFFER*);
+using BufferPlayFn=HRESULT(STDMETHODCALLTYPE*)(void*,DWORD,DWORD,DWORD);
+using BufferSetVolumeFn=HRESULT(STDMETHODCALLTYPE*)(void*,LONG);
+using BufferReleaseFn=ULONG(STDMETHODCALLTYPE*)(void*);
+CreateBufferFn originalCreateBuffer=nullptr;DuplicateBufferFn originalDuplicateBuffer=nullptr;
+// one original per vtable (the buffer classes of dsound have their own tables)
+std::unordered_map<void**,std::array<void*,3>> bufferOriginals;   // Play, SetVolume, Release
+void soundLog(const std::string& message) {
+    if(soundLogged>=12000)return;
+    ++soundLogged;status(message.c_str());
+}
+bool pedestrianName(const std::string& name) {
+    std::string key=name;for(auto& c:key)c=char(std::tolower(static_cast<unsigned char>(c)));
+    if(key.compare(0,5,"grunt")==0)return true;   // a grunt is only touched when the game plays it far below the rider's level (see the volume hook)
+    return isPedestrianSound(key);
+}
+HRESULT STDMETHODCALLTYPE bufferPlayHook(void* self,DWORD a,DWORD b,DWORD flags) {
+    uintptr_t caller=reinterpret_cast<uintptr_t>(_ReturnAddress())-base+0x400000;
+    void** table=*reinterpret_cast<void***>(self);
+    BufferPlayFn original=nullptr;SoundInfo info;bool known=false;
+    EnterCriticalSection(&soundLock);
+    auto o=bufferOriginals.find(table);if(o!=bufferOriginals.end())original=reinterpret_cast<BufferPlayFn>(o->second[0]);
+    auto s=soundBuffers.find(self);if(s!=soundBuffers.end()){info=s->second;known=true;}
+    LeaveCriticalSection(&soundLock);
+    HRESULT hr=original?original(self,a,b,flags):E_FAIL;
+    if(known && !info.name.empty()) {
+        char m[200];std::snprintf(m,sizeof m,"sound: play %s volume %s%ld%s flags 0x%lx from 0x%x at %.2f s result 0x%08lx",info.name.c_str(),info.volumeSet?"":"(never set, ",info.volumeSet?info.volume:0L,info.volumeSet?"":")",flags,unsigned(caller),double(GetTickCount()-soundStart)/1000.0,hr);
+        soundLog(m);
+    }
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE bufferSetVolumeHook(void* self,LONG volume) {
+    void** table=*reinterpret_cast<void***>(self);
+    BufferSetVolumeFn original=nullptr;bool pedestrian=false;
+    EnterCriticalSection(&soundLock);
+    auto o=bufferOriginals.find(table);if(o!=bufferOriginals.end())original=reinterpret_cast<BufferSetVolumeFn>(o->second[1]);
+    auto s=soundBuffers.find(self);
+    if(s!=soundBuffers.end()) {
+        pedestrian=pedestrianName(s->second.name);
+        if(pedestrian && volume<0) {   // the voices (not the thump or the footsteps) get their own, usually larger, relief
+            const std::string& n=s->second.name;bool voice=n.size()>4 && _strnicmp(n.c_str(),"bounce",6)!=0 && _strnicmp(n.c_str(),"footstep",8)!=0;
+            if(_strnicmp(n.c_str(),"grunt",5)==0 && volume>-1000)voice=false;   // the rider's own grunts keep the game's level
+            int relief=voice?pedestrianVoiceRelief:pedestrianRelief;
+            if(!voice && _strnicmp(n.c_str(),"grunt",5)==0)relief=0;
+            if(relief>0)volume=LONG(volume*(100-relief)/100);
+        }
+        s->second.volume=volume;s->second.volumeSet=true;
+    }
+    LeaveCriticalSection(&soundLock);
+    return original?original(self,volume):E_FAIL;
+}
+ULONG STDMETHODCALLTYPE bufferReleaseHook(void* self) {
+    void** table=*reinterpret_cast<void***>(self);
+    BufferReleaseFn original=nullptr;
+    EnterCriticalSection(&soundLock);
+    auto o=bufferOriginals.find(table);if(o!=bufferOriginals.end())original=reinterpret_cast<BufferReleaseFn>(o->second[2]);
+    LeaveCriticalSection(&soundLock);
+    ULONG left=original?original(self):0;
+    if(left==0){EnterCriticalSection(&soundLock);soundBuffers.erase(self);LeaveCriticalSection(&soundLock);}
+    return left;
+}
+void patchSlot(void** table,int index,void* hook,void*& original) {
+    DWORD old=0;
+    if(!VirtualProtect(&table[index],sizeof(void*),PAGE_EXECUTE_READWRITE,&old))return;
+    original=table[index];table[index]=hook;
+    VirtualProtect(&table[index],sizeof(void*),old,&old);
+}
+void watchBuffer(void* buffer,const std::string& name) {
+    if(!buffer)return;
+    void** table=*reinterpret_cast<void***>(buffer);
+    EnterCriticalSection(&soundLock);
+    soundBuffers[buffer].name=name;
+    if(bufferOriginals.find(table)==bufferOriginals.end()) {
+        std::array<void*,3> originals{};
+        patchSlot(table,12,reinterpret_cast<void*>(&bufferPlayHook),originals[0]);
+        patchSlot(table,15,reinterpret_cast<void*>(&bufferSetVolumeHook),originals[1]);
+        patchSlot(table,2,reinterpret_cast<void*>(&bufferReleaseHook),originals[2]);
+        bufferOriginals[table]=originals;
+    }
+    LeaveCriticalSection(&soundLock);
+}
+HRESULT STDMETHODCALLTYPE createBufferHook(void* self,const DSBUFFERDESC* desc,LPDIRECTSOUNDBUFFER* buffer,IUnknown* outer) {
+    HRESULT hr=originalCreateBuffer(self,desc,buffer,outer);
+    if(SUCCEEDED(hr) && buffer && *buffer && desc && !(desc->dwFlags&DSBCAPS_PRIMARYBUFFER)) {
+        std::string name;
+        EnterCriticalSection(&soundLock);name=lastOpenedWav;lastOpenedWav.clear();LeaveCriticalSection(&soundLock);
+        if(!name.empty())watchBuffer(*buffer,name);
+    }
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE duplicateBufferHook(void* self,LPDIRECTSOUNDBUFFER source,LPDIRECTSOUNDBUFFER* buffer) {
+    HRESULT hr=originalDuplicateBuffer(self,source,buffer);
+    if(SUCCEEDED(hr) && buffer && *buffer) {
+        std::string name;
+        EnterCriticalSection(&soundLock);auto s=soundBuffers.find(source);if(s!=soundBuffers.end())name=s->second.name;LeaveCriticalSection(&soundLock);
+        if(!name.empty())watchBuffer(*buffer,name);
+    }
+    return hr;
+}
+using DirectSoundCreateFn=HRESULT(WINAPI*)(LPCGUID,LPDIRECTSOUND*,IUnknown*);
+DirectSoundCreateFn originalDirectSoundCreate=nullptr;
+HRESULT WINAPI directSoundCreateHook(LPCGUID device,LPDIRECTSOUND* sound,IUnknown* outer) {
+    HRESULT hr=originalDirectSoundCreate(device,sound,outer);
+    if(SUCCEEDED(hr) && sound && *sound && !originalCreateBuffer) {
+        void** table=*reinterpret_cast<void***>(*sound);
+        void* o1=nullptr;void* o2=nullptr;
+        patchSlot(table,3,reinterpret_cast<void*>(&createBufferHook),o1);
+        patchSlot(table,5,reinterpret_cast<void*>(&duplicateBufferHook),o2);
+        originalCreateBuffer=reinterpret_cast<CreateBufferFn>(o1);originalDuplicateBuffer=reinterpret_cast<DuplicateBufferFn>(o2);
+        status("sound: DirectSound buffers are watched (the first play / volume events are logged)");
+    }
+    return hr;
+}
+// Play requests. Every effect the game wants to play goes through one thunk (0x40136b, thiscall: ecx = the effect object, edx and
+// three stack values) that is called from 23 places in the game's sound event dispatcher (0x447900). The 23 calls are routed through a
+// small stub that writes the request to the log - which call site asked for which effect - before the original thunk runs. A request
+// that the game then drops (the effect is still playing) never reaches DirectSound, so only this log shows it.
+uintptr_t playThunk=0;
+bool effectBuffer(void* effect,void** buffer) {   // no objects here, so SEH is allowed
+    __try {*buffer=*reinterpret_cast<void**>(static_cast<uint8_t*>(effect)+0x24);return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+}
+extern "C" void __cdecl logPlayRequest(uintptr_t returnAddress,void* effect) {
+    if(soundLogged>=12000)return;
+    std::string name="?";
+    void* buffer=nullptr;
+    if(effectBuffer(effect,&buffer)) {
+        EnterCriticalSection(&soundLock);
+        auto s=soundBuffers.find(buffer);if(s!=soundBuffers.end())name=s->second.name;
+        LeaveCriticalSection(&soundLock);
+    }
+    char m[160];std::snprintf(m,sizeof m,"sound: request %s from 0x%x at %.2f s",name.c_str(),unsigned(returnAddress-5-base+0x400000),double(GetTickCount()-soundStart)/1000.0);
+    soundLog(m);
+}
+__declspec(naked) void playRequestStub() {
+    __asm {
+        push ecx
+        push edx
+        push ecx
+        mov eax,[esp+12]      // return address of the original call
+        push eax
+        call logPlayRequest
+        add esp,8
+        pop edx
+        pop ecx
+        jmp dword ptr [playThunk]
+    }
+}
+// Sound events. The game queues a sound event with one function (0x446c70, reached through the thunk 0x402a6d; thiscall: ecx = event
+// type, edx = pointer to the parameters, up to 10 events wait in the queue and an eleventh is dropped). 29 places in the game do it.
+// The pedestrians' voices are type 22 (0x16): the pedestrian code (0x4550a0) asks the pedestrian's own data for a sound list,
+// picks one entry and queues it with its number as the first parameter. Every queued event is logged: type, first parameter,
+// the place in the game that queued it. For type 22 the effect is number (parameter - 69), see the names in the log.
+uintptr_t eventThunk=0;
+bool readInt(const void* address,int* value) {   // no objects here, so SEH is allowed
+    __try {*value=*static_cast<const int*>(address);return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+}
+extern "C" void __cdecl logSoundEvent(uintptr_t returnAddress,int type,const void* parameters) {
+    if(soundLogged>=12000)return;
+    int first=0;bool have=parameters && readInt(parameters,&first);
+    char m[180];
+    if(have)std::snprintf(m,sizeof m,"sound: event type %d parameter %d from 0x%x at %.2f s",type,first,unsigned(returnAddress-5-base+0x400000),double(GetTickCount()-soundStart)/1000.0);
+    else std::snprintf(m,sizeof m,"sound: event type %d (no parameter) from 0x%x at %.2f s",type,unsigned(returnAddress-5-base+0x400000),double(GetTickCount()-soundStart)/1000.0);
+    soundLog(m);
+}
+__declspec(naked) void soundEventStub() {
+    __asm {
+        push ecx
+        push edx
+        push edx
+        push ecx
+        mov eax,[esp+16]      // return address of the original call
+        push eax
+        call logSoundEvent
+        add esp,12
+        pop edx
+        pop ecx
+        jmp dword ptr [eventThunk]
+    }
+}
+// Pedestrian voices, record side. The pedestrian code (0x4550a0) asks the table lookup (thunk 0x4013d9 -> 0x465850; thiscall: ecx = the
+// pedestrian's record handle from [pedestrian+0x1dc], edx = group 2, one stack value = 2 for the first reaction, 3 for the second).
+// The two calls (0x455143, 0x455210) are logged with the pedestrian, handle (bank = bits 6-7, record = bits 0-5) and the slot; the
+// voice that comes out of it follows as the "event type 22" line.
+uintptr_t pedestrianThunk=0;
+extern "C" void __cdecl logPedestrianLookup(unsigned handle,unsigned group,unsigned pedestrian,unsigned slot) {
+    if(soundLogged>=12000)return;
+    char m[200];std::snprintf(m,sizeof m,"sound: pedestrian 0x%x handle 0x%x (bank %u record %u) group %u slot %u at %.2f s",
+                              pedestrian,handle,(handle>>6)&3,handle&0x3f,group,slot,double(GetTickCount()-soundStart)/1000.0);
+    soundLog(m);
+}
+// Female voices (FG1_WATC, FG2_EEK). Both effects are loaded by the game but no pedestrian record points to them. The pedestrian
+// record bank 0 / record 1 (handle 0x1, a woman, seen in the log) has no voice at all: its sound table gives nothing, so she stays
+// silent. When the table gives nothing for that record, the lookup returns a small entry that names FG1_WATC (first reaction) or
+// FG2_EEK (second one). The game reads the sound number from the entry (+8, big-endian, effect index + 69) like from its own data.
+struct FakeSoundEntry{uint8_t pad[8];uint32_t numberBigEndian;uint32_t tail;};
+FakeSoundEntry femaleFirst={{0},0x68000000u,0},femaleSecond={{0},0x67000000u,0};   // 104 = FG1_WATC (36+68), 103 = FG2_EEK (35+68)
+FakeSoundEntry chosenEntry={{0},0,0};
+// Pedestrian voice rules ([PedestrianVoices.ini] next to the game's ini; made from the Excel table by tools\build_voices_ini.py): for
+// every set of pedestrian sprites (OLDWMN, AVGW, CTM1, ...) a pool of effects for the first reaction (First=) and one for the second
+// (Second=). When the pedestrian that reacts is recognised, one effect of its pool is drawn at random instead of the game's own entry.
+// A sound number is the effect's position in the game's effect list (0x505d20) + 68.
+const char* const effectNames[]={"EngRat","EngSport","EngSuper","EngNitro","EngTunne","EngOther","Engcar11","M_YEAH","F_YEAH","CHAINIMP","CLUBIMPA","BOUNCE",
+    "CRASHHAR","CRASHMED","CRASHLIT","GRUNTM1_","GRUNTM2_","GRUNTM3_","GRUNTF1_","GRUNTF2_","GRUNTF3_","KICK_MW4","PUNCHHEA","SWISHCHA","SWISHGEN","SKIDONNR",
+    "SKIDOFFR","FOOTSTEP","RIDERSLI","BMWLONG","SIREN","SIRENFST","SK1_EATT","BKM1_HEY","BSW3_HEY","FG2_EEK","FG1_WATC","BKM4_PTY","SK1_DUDE","TOUR_BAC","DM_USOB",
+    "BSM1_TAK","BKW3_STP","CM3_ARRG","BKW1_DON","HF_HELP","DM_HOLYS","OL_AAA","AF1_EEK","BKM1_HUH","AM1_DOOO","BSW1_NO","CW_BACK","BSW1_HUH","BKM4_WAI","JF_NO",
+    "FCYC_WAT","TOUR_AAA","BKM2_HLD","BKM4_RUM","FM_SLOWD","BSM1_WAT","BSM3_WHA","BSM2_WOA","BSW2_AAA","JM_AIIE","BKW2_BIT","CM1_HEYM","OL_MAKE"};
+struct VoiceRule{std::vector<int> first,second;bool both=false;};
+std::map<std::string,VoiceRule> voiceRules;
+bool voiceRulesOn=true;
+unsigned voiceRandom=GetTickCount()*2654435761u+12345u;
+unsigned nextRandom(){voiceRandom=voiceRandom*1664525u+1013904223u;return voiceRandom>>8;}
+std::vector<int> parseEffectList(const std::wstring& text) {
+    std::vector<int> result;
+    std::string word;
+    auto flush=[&]() {
+        while(!word.empty() && word.back()==' ')word.pop_back();
+        size_t dot=word.rfind('.');if(dot!=std::string::npos)word.resize(dot);
+        std::string upper=word;for(auto& c:upper)c=char(std::toupper(static_cast<unsigned char>(c)));
+        word.clear();
+        if(upper.empty())return;
+        for(int i=0;i<int(sizeof effectNames/sizeof effectNames[0]);++i) {
+            std::string name=effectNames[i];for(auto& c:name)c=char(std::toupper(static_cast<unsigned char>(c)));
+            if(name==upper){result.push_back(i+68);return;}
+        }
+        char m[100];std::snprintf(m,sizeof m,"voices: unknown effect '%s' ignored",upper.c_str());status(m);
+    };
+    for(wchar_t c:text) {
+        if(c==L',' || c==L';')flush();
+        else if(c>32 && c<127)word+=char(c);
+        else if(c==L' ' && !word.empty())word+=' ';
+    }
+    flush();
+    return result;
+}
+void loadVoiceRules() {
+    voiceRules.clear();
+    size_t slash=configPath.find_last_of(L"\\/");
+    std::wstring path=(slash==std::wstring::npos?std::wstring():configPath.substr(0,slash+1))+L"PedestrianVoices.ini";
+    if(GetFileAttributesW(path.c_str())==INVALID_FILE_ATTRIBUTES){status("voices: PedestrianVoices.ini not found, the game's own voices stay");return;}
+    std::vector<wchar_t> names(32768);
+    DWORD n=GetPrivateProfileSectionNamesW(names.data(),DWORD(names.size()),path.c_str());
+    int sets=0;
+    for(size_t i=0;i<n && names[i];) {
+        std::wstring section=names.data()+i;i+=section.size()+1;
+        wchar_t first[2048]={0},second[2048]={0};
+        GetPrivateProfileStringW(section.c_str(),L"First",L"",first,2048,path.c_str());
+        GetPrivateProfileStringW(section.c_str(),L"Second",L"",second,2048,path.c_str());
+        VoiceRule rule;rule.first=parseEffectList(first);rule.second=parseEffectList(second);
+        rule.both=GetPrivateProfileIntW(section.c_str(),L"Both",0,path.c_str())!=0;
+        std::string key;for(wchar_t c:section)key+=char(c);
+        for(auto& c:key)c=char(std::toupper(static_cast<unsigned char>(c)));
+        if(!rule.first.empty() || !rule.second.empty()){voiceRules[key]=rule;++sets;}
+    }
+    char m[100];std::snprintf(m,sizeof m,"voices: rules for %d pedestrian sets loaded",sets);status(m);
+}
+// Which pedestrian reacts? The pedestrian object (0x4550a0, edi) leads to its sprite data; every sprite is a chunk "RRPD" (stored
+// byte-reversed as 'DPRR') with the magic 0xBC614E at +8 and its name ("OLDWMN05") at +0x18. The object's dwords that look like
+// pointers are followed (and the pointers found in what they point at), and the chunk is searched for in the memory around each.
+bool readMemory(const void* from,void* to,size_t count) {   // no objects here, so SEH is allowed
+    __try {memcpy(to,from,count);return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+}
+bool spriteNameIn(const uint8_t* block,size_t size,char* name) {
+    for(size_t i=0;i+0x20<=size;++i) {
+        if(block[i]=='D' && block[i+1]=='P' && block[i+2]=='R' && block[i+3]=='R' && *reinterpret_cast<const uint32_t*>(block+i+8)==0xBC614Eu) {
+            const char* n=reinterpret_cast<const char*>(block+i+0x18);
+            size_t len=0;while(len<8 && n[len] && ((n[len]>='A'&&n[len]<='Z')||(n[len]>='0'&&n[len]<='9')||n[len]=='_'||n[len]=='@'))++len;
+            if(len>=3){std::memcpy(name,n,len);name[len]=0;return true;}
+        }
+    }
+    return false;
+}
+bool spriteNameAround(uintptr_t pointer,char* name) {
+    static uint8_t block[0x800+0x40];
+    if(pointer<0x10000 || pointer>=0x7fff0000u || (pointer&3))return false;
+    if(readMemory(reinterpret_cast<const void*>(pointer),block+0x400,0x440) && spriteNameIn(block+0x400,0x440,name))return true;
+    if(readMemory(reinterpret_cast<const void*>(pointer-0x400),block,0x400) && spriteNameIn(block,0x400,name))return true;
+    return false;
+}
+bool pedestrianSprite(uintptr_t pedestrian,char* name,unsigned* where) {
+    static uint32_t object[0x90];
+    if(!readMemory(reinterpret_cast<const void*>(pedestrian),object,sizeof object))return false;
+    for(unsigned i=0;i<0x90;++i)if(spriteNameAround(object[i],name)){*where=i*4;return true;}
+    for(unsigned i=0;i<0x90;++i) {
+        uintptr_t inner=object[i];
+        static uint32_t second[0x40];
+        if(inner<0x10000 || inner>=0x7fff0000u || (inner&3) || !readMemory(reinterpret_cast<const void*>(inner),second,sizeof second))continue;
+        for(unsigned k=0;k<0x40;++k)if(spriteNameAround(second[k],name)){*where=0x1000+i*4;return true;}
+    }
+    return false;
+}
+std::string spriteSetOf(const char* name) {
+    static const char* const sets[]={"OLDWMN","AVGW","AVGM","BCHW","BKM1","BKM3","BKW1","BKW2","BKW3","CTM1","CTM2","CTM3","CTM4","CTW1","FEMHIT","JGW","MJOG",
+        "TRSTW","TNSM","HHM","HHW","DAVEEK","COWEEK","SKR2NW","SKTR2","BMN1DS","DVRW","FLM","SFRM","BKR2MD","BKR4DL","BKRGRP","BUSM2","BUSM3","BUSW2","BUSW3","FLG2","FLGRL"};
+    for(const char* set:sets)if(std::strncmp(name,set,std::strlen(set))==0)return set;
+    return "";
+}
+// Minimum time between two first-reaction voices ([Audio] PedestrianVoiceGapMs, default 120 ms): every pedestrian in reach reacts to the
+// rider's blow, so a fight can make a chorus. A voice that comes too soon after the previous one is dropped (the game then makes none).
+DWORD lastFirstVoice=0;
+extern "C" void* __cdecl fixPedestrianLookup(void* result,unsigned handle,unsigned slot,void* pedestrian) {
+    if(slot!=2 && slot!=3)return result;
+    if(slot==2 && pedestrianVoiceGapMs>0) {
+        DWORD now=GetTickCount();
+        if(lastFirstVoice && now-lastFirstVoice<DWORD(pedestrianVoiceGapMs)) {
+            if(soundLogged<12000){char m[120];std::snprintf(m,sizeof m,"sound: pedestrian voice dropped, %lu ms after the previous one (minimum %d)",now-lastFirstVoice,pedestrianVoiceGapMs);soundLog(m);}
+            return nullptr;
+        }
+        if(result)lastFirstVoice=now;
+    }
+    if(voiceRulesOn && !voiceRules.empty()) {
+        char name[16]={0};unsigned where=0;
+        if(pedestrianSprite(reinterpret_cast<uintptr_t>(pedestrian),name,&where)) {
+            std::string set=spriteSetOf(name);
+            auto rule=voiceRules.find(set);
+            if(rule!=voiceRules.end()) {
+                std::vector<int> merged;   // Both=1: a pedestrian who only ever makes the first reaction (hit at speed) draws from both pools
+                if(slot==2 && rule->second.both){merged=rule->second.first;merged.insert(merged.end(),rule->second.second.begin(),rule->second.second.end());}
+                const std::vector<int>& pool=slot==2?(rule->second.both?merged:rule->second.first):rule->second.second;
+                if(!pool.empty()) {
+                    int number=pool[nextRandom()%pool.size()];
+                    chosenEntry.numberBigEndian=_byteswap_ulong(uint32_t(number));
+                    if(slot==2)lastFirstVoice=GetTickCount();
+                    if(soundLogged<12000) {
+                        char m[200];std::snprintf(m,sizeof m,"sound: pedestrian sprite %s (set %s, field 0x%x) slot %u: %s from %u",name,set.c_str(),where,slot,effectNames[number-68],unsigned(pool.size()));
+                        soundLog(m);
+                    }
+                    return &chosenEntry;
+                }
+            } else if(soundLogged<12000) {
+                char m[160];std::snprintf(m,sizeof m,"sound: pedestrian sprite %s (set %s) has no voice rule",name,set.empty()?"unknown":set.c_str());soundLog(m);
+            }
+        } else if(soundLogged<12000) {
+            char m[100];std::snprintf(m,sizeof m,"sound: pedestrian 0x%x: sprite not found",unsigned(reinterpret_cast<uintptr_t>(pedestrian)));soundLog(m);
+        }
+    }
+    if(result || !femaleVoiceFallback || handle!=0x1)return result;
+    if(soundLogged<12000) {char m[120];std::snprintf(m,sizeof m,"sound: pedestrian record 0x1 has no voice in slot %u, FG%s is used",slot,slot==2?"1_WATC":"2_EEK");soundLog(m);}
+    if(slot==2)lastFirstVoice=GetTickCount();
+    return slot==2?&femaleFirst:&femaleSecond;
+}
+__declspec(naked) void pedestrianLookupStub() {
+    __asm {
+        push ecx
+        push edx
+        push dword ptr [esp+12]   // the stack value of the original call
+        push edi                  // the pedestrian
+        push edx
+        push ecx
+        call logPedestrianLookup
+        add esp,16
+        pop edx
+        pop ecx
+        push ecx
+        push dword ptr [esp+8]    // call the original lookup with the same arguments
+        call dword ptr [pedestrianThunk]
+        pop ecx
+        push edi
+        push dword ptr [esp+8]
+        push ecx
+        push eax
+        call fixPedestrianLookup
+        add esp,16
+        ret 4
+    }
+}
+__declspec(naked) void pedestrianLookupStubB() {
+    __asm {
+        push ecx
+        push edx
+        push dword ptr [esp+12]   // the stack value of the original call
+        push ebx                  // the pedestrian (this code keeps it in ebx)
+        push edx
+        push ecx
+        call logPedestrianLookup
+        add esp,16
+        pop edx
+        pop ecx
+        push ecx
+        push dword ptr [esp+8]    // call the original lookup with the same arguments
+        call dword ptr [pedestrianThunk]
+        pop ecx
+        push ebx
+        push dword ptr [esp+8]
+        push ecx
+        push eax
+        call fixPedestrianLookup
+        add esp,16
+        ret 4
+    }
+}
+// Diagnostics: the lookups of the pedestrian's animations (slots 0 and 1 of group 2: 0x454ff3, 0x455009, 0x455c86, 0x455c9b). The
+// pedestrian is only "alive" (0x1e0 = 1, 0x455e20) when the init at 0x455c60 finds both. Every one is logged with the result and the
+// sprite set, to see which objects (e.g. the flag girls) take part.
+extern "C" void __cdecl logLookupSite(unsigned returnAddress,unsigned handle,unsigned slot,void* result,void* pedestrian) {
+    if(soundLogged>=12000)return;
+    static std::map<uint64_t,int> seen;   // the animation lookups repeat every frame: one line per object and place is enough
+    uint64_t key=(uint64_t(reinterpret_cast<uintptr_t>(pedestrian))<<32)|(returnAddress&0xffffffu);
+    if(seen.size()>4000)seen.clear();
+    if(seen[key]++)return;
+    char sprite[16]="?";unsigned where=0;
+    if(!pedestrianSprite(reinterpret_cast<uintptr_t>(pedestrian),sprite,&where))std::strcpy(sprite,"?");
+    char m[220];std::snprintf(m,sizeof m,"sound: lookup at 0x%x handle 0x%x slot %u -> %s (object 0x%x, sprite %s)",
+                              unsigned(returnAddress-5-base+0x400000),handle,slot,result?"found":"nothing",unsigned(reinterpret_cast<uintptr_t>(pedestrian)),sprite);
+    soundLog(m);
+}
+__declspec(naked) void animationLookupStub() {   // the object is in esi at these four calls
+    __asm {
+        push ecx
+        push dword ptr [esp+8]
+        call dword ptr [pedestrianThunk]
+        pop ecx
+        push eax
+        push esi
+        push eax
+        push dword ptr [esp+16]
+        push ecx
+        push dword ptr [esp+20]
+        call logLookupSite
+        add esp,20             // the five arguments; the saved result stays
+        pop eax
+        ret 4
+    }
+}
+// Diagnostics: the pedestrian reaction (0x4550a0) is a virtual method (table entry 0x596768). Its call is wrapped to log the object's
+// state whenever it changes (alive flag, state, the flags that decide which sound is made, the rider's speed), per object.
+void* reactionOriginal=nullptr;
+struct ReactionState{int alive,state,a,b,c,d,riderState,riderSpeed;};
+std::map<uintptr_t,ReactionState> reactionStates;
+extern "C" void __cdecl logReaction(void* object) {
+    if(soundLogged>=12000)return;
+    static uint8_t copy[0x230];
+    if(!readMemory(object,copy,sizeof copy))return;
+    ReactionState now{copy[0x1e0],*reinterpret_cast<int*>(copy+0x1e8),*reinterpret_cast<int*>(copy+0x1ec),*reinterpret_cast<int*>(copy+0x210),
+                      *reinterpret_cast<int*>(copy+0x218),*reinterpret_cast<int*>(copy+0x21c),-1,0};
+    uintptr_t rider=*reinterpret_cast<uintptr_t*>(copy+0x1a0);
+    static uint8_t riderCopy[0x100];
+    if(rider>0x10000 && readMemory(reinterpret_cast<void*>(rider),riderCopy,sizeof riderCopy)){now.riderState=*reinterpret_cast<int*>(riderCopy+0xc4);now.riderSpeed=*reinterpret_cast<int*>(riderCopy+0xec);}
+    auto key=reinterpret_cast<uintptr_t>(object);
+    auto it=reactionStates.find(key);
+    if(it!=reactionStates.end() && it->second.alive==now.alive && it->second.state==now.state && it->second.a==now.a && it->second.b==now.b && it->second.c==now.c && it->second.d==now.d && it->second.riderState==now.riderState)return;
+    if(reactionStates.size()>512)reactionStates.clear();
+    reactionStates[key]=now;
+    char sprite[16]="?";unsigned where=0;
+    if(!pedestrianSprite(key,sprite,&where))std::strcpy(sprite,"?");
+    char m[240];std::snprintf(m,sizeof m,"sound: reaction obj 0x%x sprite %s: alive %d state %d, 0x1ec=%d 0x210=%d 0x218=%d 0x21c=%d, rider state %d speed %d",
+                              unsigned(key),sprite,now.alive,now.state,now.a,now.b,now.c,now.d,now.riderState,now.riderSpeed);
+    soundLog(m);
+}
+__declspec(naked) void reactionStub() {
+    __asm {
+        push ecx
+        push ecx
+        call logReaction
+        add esp,4
+        pop ecx
+        jmp dword ptr [reactionOriginal]
+    }
+}
+// The first reaction of a pedestrian (0x455114) makes no voice when the pedestrian is farther than 0x400 from the camera
+// (cmp eax,0x400 / ja at 0x455122, eax = position difference). A flag girl hit at the start stands farther than that, so she fell
+// without a sound; the check of the time since the last sound (180 ticks, 0x455129) can do the same right after the start of a race. For the two flag girl sets (FLG2, FLGRL) both checks are skipped; every other pedestrian keeps the game's rule.
+uintptr_t voiceContinue=0,voiceSkip=0,voiceTimeAddress=0,voiceFlagContinue=0;
+extern "C" int __cdecl flagGirlVoiceCheck(void* pedestrian,unsigned difference) {
+    char name[16]={0};unsigned where=0;
+    if(!voiceRulesOn || !pedestrianSprite(reinterpret_cast<uintptr_t>(pedestrian),name,&where))return 0;
+    std::string set=spriteSetOf(name);
+    if(set!="FLG2" && set!="FLGRL")return 0;
+    if(soundLogged<12000) {char m[140];std::snprintf(m,sizeof m,"sound: %s first reaction: distance 0x%x (the game's limit 0x400); the time check is skipped for every pedestrian",set.c_str(),difference);soundLog(m);}
+    return 1;
+}
+__declspec(naked) void flagGirlVoiceStub() {
+    __asm {
+        push eax
+        push ecx
+        push edx
+        push eax
+        push edi
+        call flagGirlVoiceCheck
+        add esp,8
+        test eax,eax
+        pop edx
+        pop ecx
+        pop eax
+        jnz flagGirl
+        cmp eax,0x400
+        ja skip
+    flagGirl:
+        jmp dword ptr [voiceFlagContinue]   // past the distance check and the 180-tick check (0x455136)
+    skip:
+        jmp dword ptr [voiceSkip]
+    }
+}
+// Punch shadow (original game bug). The rider's shadow sprites (DATA\BIKERS\HiShadow.DAT / LoShadow.DAT, 326 frames) are width, height and
+// width*height pixels each; the game centres a sprite by its box. Frame 176, the first frame of the punch, has two stray pixels in the top
+// right corner of its box (rows 0-1), so the box is 118x168 (Lo: 59x84) while the shadow itself is 13 rows (Lo: 6) at the bottom: the shadow
+// is drawn far from the bike and cannot be seen well. When the sprites have been loaded (end of the loader at 0x458e00) the table entry
+// of frame 176 is pointed at a copy cut to the shadow itself (padded to even sizes like every other shadow frame). The game's file is
+// never changed; anything unexpected leaves the table as it is.
+bool fixPunchShadow=true;
+void fixPunchShadowFrame() {
+    uint8_t* entry=reinterpret_cast<uint8_t*>(base+0x5cb6f0-0x400000)+176*8;   // table of the 326 shadow frames: pixels (4), width, height
+    uint8_t* pixels=*reinterpret_cast<uint8_t**>(entry);
+    int w=entry[4],h=entry[5];
+    if(!pixels || !((w==118 && h==168) || (w==59 && h==84)))return;
+    // the shadow: the lowest band of rows that are in use without a gap; the stray pixels are above a gap
+    int bottom=-1,top=-1;
+    for(int y=h-1;y>=0;--y) {
+        bool used=false;
+        for(int x=0;x<w && !used;++x)used=pixels[y*w+x]!=0;
+        if(used){if(bottom<0)bottom=y;top=y;}
+        else if(bottom>=0)break;
+    }
+    if(bottom<0 || bottom-top+1<4)return;
+    int left=w,right=-1,strayPixels=0;
+    for(int y=0;y<h;++y)for(int x=0;x<w;++x)if(pixels[y*w+x]) {
+        if(y<top)++strayPixels;
+        else {left=std::min(left,x);right=std::max(right,x);}
+    }
+    int newW=right-left+1,newH=bottom-top+1;
+    if(newW<8 || newW>w || strayPixels==0 || strayPixels>8)return;
+    int paddedW=(newW+1)&~1,paddedH=(newH+1)&~1;
+    static uint8_t fixed[2][64*32];
+    uint8_t* out=fixed[w==118?0:1];
+    if(paddedW*paddedH>int(sizeof fixed[0]))return;
+    std::memset(out,0,sizeof fixed[0]);
+    for(int y=0;y<newH;++y)for(int x=0;x<newW;++x)out[y*paddedW+x]=pixels[(top+y)*w+left+x];
+    *reinterpret_cast<uint8_t**>(entry)=out;entry[4]=uint8_t(paddedW);entry[5]=uint8_t(paddedH);
+    char m[160];std::snprintf(m,sizeof m,"punch shadow: frame 176 cut from %dx%d to %dx%d (%d stray pixels removed)",w,h,paddedW,paddedH,strayPixels);status(m);
+}
+__declspec(naked) void punchShadowStub() {   // replaces "mov eax,1" at the end of the sprite loader; the "ret" after it stays
+    __asm {
+        pushad
+        call fixPunchShadowFrame
+        popad
+        mov eax,1
+        ret
+    }
+}
+// Native DualSense / DualShock input over HID ([Input] DualSenseFilter, DualSenseBluetooth, DpadSteering). The game reads Sony pads itself (vendor 0x54c;
+// DualShock 4 = type 1, DualSense = type 2) but: (1) it opens every HID interface of the device, including ones that are not a gamepad, whose reports
+// look like a stick held up (menus scrolled upward); (2) it does not know the DualSense Bluetooth reports (id 0x01 short, id 0x31 long); (3) the
+// d-pad is stored as a hat angle that nothing reads for steering. The three patches below follow the findings of issue #4 of the repository
+// (CypherCripto): the offsets were checked against the game's code here; every site is verified byte by byte first.
+uintptr_t hidDelta=0,hidAccept=0,hidReject=0,hidCompact=0,hidStandard=0,hidDpadBack=0;   // delta = loaded base - 0x400000
+__declspec(naked) void hidFilterStub() {   // at 0x463645: only HID usage page 1 usage 4 (joystick) or 5 (game pad) is a pad
+    __asm {
+        cmp dword ptr [ebp-0x7c],0x10005
+        je accept
+        cmp dword ptr [ebp-0x7c],0x10004
+        jne reject
+    accept:
+        mov ax,word ptr [ebp-0x76]
+        mov cx,word ptr [ebp-0x78]
+        jmp dword ptr [hidAccept]
+    reject:
+        jmp dword ptr [hidReject]
+    }
+}
+__declspec(naked) void hidBluetoothStub() {   // at 0x463770: the report decoder (ecx = report). Report id 1 with a 78 byte input length = Bluetooth short
+    __asm {                                  // report (the DualShock 4 layout); id 0x31 = Bluetooth long report, one byte later than the USB one
+        push esi
+        mov esi,ecx
+        mov edx,dword ptr [hidDelta]
+        cmp byte ptr [esi],1
+        jne other
+        cmp dword ptr [edx+0x5cda24],2
+        jne standard
+        cmp word ptr [edx+0x5cda28],0x4e
+        jne standard
+        push ebx
+        mov eax,1
+        jmp dword ptr [hidCompact]
+    standard:
+        jmp dword ptr [hidStandard]
+    other:
+        cmp byte ptr [esi],0x31
+        jne reject
+        cmp dword ptr [edx+0x5cda24],2
+        jne reject
+        inc esi
+        jmp dword ptr [hidStandard]
+    reject:
+        pop esi
+        ret
+    }
+}
+extern "C" void __cdecl dpadToAxes(int hat) {   // hat: 0 up, 1 up-right, 2 right ... 7 up-left (8 = released); axes are 0..0xffff, centre 0x8000
+    uint32_t* x=reinterpret_cast<uint32_t*>(hidDelta+0x5cdad0);uint32_t* y=reinterpret_cast<uint32_t*>(hidDelta+0x5cdad4);
+    if(hat<0 || hat>7)return;
+    if(hat==1 || hat==2 || hat==3)*x=0xffff;
+    else if(hat==5 || hat==6 || hat==7)*x=0;
+    if(hat==7 || hat==0 || hat==1)*y=0;
+    else if(hat==3 || hat==4 || hat==5)*y=0xffff;
+}
+__declspec(naked) void dpadStub() {   // replaces "mov [0x5cdaf0],esi" in the report decoder; [ebp+0x18] is the hat of the report
+    __asm {
+        pushfd
+        push eax
+        push ecx
+        push edx
+        mov edx,dword ptr [hidDelta]
+        mov dword ptr [edx+0x5cdaf0],esi
+        movzx eax,byte ptr [ebp+0x18]
+        push eax
+        call dpadToAxes
+        add esp,4
+        pop edx
+        pop ecx
+        pop eax
+        popfd
+        jmp dword ptr [hidDpadBack]
+    }
+}
+bool dualSense=false,dualMonitorUx=false;   // [Input] DualSense (Bluetooth reports + d-pad steering), [Window] DualMonitorUX (free cursor + no minimize)
+bool matchBytes(uintptr_t va,const uint8_t* expect,size_t length) {
+    for(size_t i=0;i<length;++i)if(at<uint8_t>(va+i)!=expect[i])return false;
+    return true;
+}
+void installHidAndWindowFixes() {
+    hidDelta=base-0x400000;hidAccept=base+0x46364d-0x400000;hidReject=base+0x463688-0x400000;hidCompact=base+0x46378b-0x400000;hidStandard=base+0x46377c-0x400000;hidDpadBack=base+0x463384-0x400000;
+    {   // always on: only game pad / joystick HID interfaces are opened
+        const uint8_t expect[8]={0x66,0x8b,0x45,0x8a,0x66,0x8b,0x4d,0x88};
+        if(matchBytes(0x463645,expect,8)) {
+            bool ok=branch(0x463645,reinterpret_cast<void*>(&hidFilterStub),0xe9);
+            if(ok){const uint8_t nops[3]={0x90,0x90,0x90};ok=writeMemory(base+0x46364a-0x400000,nops,3);}
+            status(ok?"DualSense: only game pad HID interfaces are opened":"DualSense interface filter could not be installed");
+        } else status("DualSense interface filter skipped: the HID code is not as expected");
+    }
+    if(dualSense) {
+        const uint8_t expect[12]={0x56,0x8b,0xf1,0x80,0x3e,0x01,0x0f,0x85,0x48,0x01,0x00,0x00};
+        if(matchBytes(0x463770,expect,12)) {
+            bool ok=branch(0x463770,reinterpret_cast<void*>(&hidBluetoothStub),0xe9);
+            if(ok){const uint8_t nops[7]={0x90,0x90,0x90,0x90,0x90,0x90,0x90};ok=writeMemory(base+0x463775-0x400000,nops,7);}
+            status(ok?"DualSense: Bluetooth reports understood":"DualSense Bluetooth patch could not be installed");
+        } else status("DualSense Bluetooth patch skipped: the report decoder is not as expected");
+    }
+    if(dualSense) {
+        const uint8_t expect[2]={0x89,0x35};
+        if(matchBytes(0x46337e,expect,2) && at<uint32_t>(0x463380)==uint32_t(base+0x5cdaf0-0x400000)) {
+            bool ok=branch(0x46337e,reinterpret_cast<void*>(&dpadStub),0xe9);
+            if(ok){const uint8_t nop=0x90;ok=writeMemory(base+0x463383-0x400000,&nop,1);}
+            status(ok?"D-pad steering installed (HID pads)":"D-pad steering could not be installed");
+        } else status("D-pad steering skipped: the report decoder is not as expected");
+    }
+    if(dualMonitorUx) {
+        const uint8_t expect[4]={0x85,0xc9,0x74,0x64},patch[2]={0x31,0xc9};
+        if(matchBytes(0x46e2e0,expect,4))status(writeMemory(base+0x46e2e0-0x400000,patch,2)?"mouse cursor is not confined to the window":"free cursor could not be installed");
+        else status("free cursor skipped: the cursor code is not as expected");
+    }
+    if(dualMonitorUx) {
+        const uint8_t expect[5]={0x6a,0x06,0x57,0xff,0x15},patch[2]={0xeb,0x07};
+        if(matchBytes(0x43deef,expect,5))status(writeMemory(base+0x43deef-0x400000,patch,2)?"the game is not minimized when it loses focus":"no-minimize could not be installed");
+        else status("no-minimize skipped: the focus code is not as expected");
+    }
+}
+// Analog throttle ([Input] AnalogThrottle). The game reads the right trigger of an Xbox pad as a button (above 30 of 255 it is "pressed") and a
+// pressed accelerate button sets the throttle value 0x603664 to 0x20 (full), so a light touch of the trigger gives full throttle and slow speeds
+// cannot be held. With this switch the throttle follows the pressure of the trigger: the value is 0x20 * t^curve, t = (trigger - 30) / 225
+// (curve 1 = linear, larger = gentler at the start). Keyboard, pad buttons and the stick (analog) are not touched: only a pressed right trigger
+// is turned into an analog value. The patch replaces "mov [0x603664],0x20" in the pad button handler 0x46bf00 (control 9, accelerate).
+bool analogThrottle=true,throttleSpeedMode=true;double throttleCurve=1.0,throttleTopSpeed=4500,throttleBand=700;int throttleMinimum=2,throttleThreshold=14;uintptr_t throttleVariable=0;   // Pressure mode (the game's own analog throttle value)
+// Speed mode (the default): the trigger sets a TARGET SPEED, top speed * t^curve, and the throttle is what is needed to reach it: full power when the
+// bike is more than "band" below the target, none when it is at or above it. A light press then gives a slow, steady speed instead of a slow
+// acceleration that never ends. The speed is the bike's own (the player object at 0x5a69ec, +0xec; about 1800 is a normal race speed).
+bool readInt(const void* address,int* value);
+int playerSpeed() {
+    int object=0,speed=0;
+    if(!readInt(reinterpret_cast<const void*>(base+0x5a69ec-0x400000),&object) || object<0x10000)return -1;
+    if(!readInt(reinterpret_cast<const void*>(uintptr_t(object)+0xec),&speed))return -1;
+    return speed<0?-speed:speed;
+}
+extern "C" int __cdecl analogThrottleValue() {
+    int trigger=padRightTrigger;
+    if(trigger<=throttleThreshold)return 0x20;   // not the trigger (keyboard, a button, ...): full throttle as before
+    double t=std::min(1.0,(trigger-throttleThreshold)/double(255-throttleThreshold));
+    if(t>=0.97)return 0x20;
+    if(throttleSpeedMode) {
+        int speed=playerSpeed();
+        if(speed>=0) {
+            double target=throttleTopSpeed*std::pow(t,throttleCurve);
+            double value=32.0*(target-speed)/throttleBand;
+            return int(std::max(0.0,std::min(32.0,std::floor(value+0.5))));
+        }
+    }
+    int value=int(std::floor(32.0*std::pow(t,throttleCurve)+0.5));
+    return std::max(throttleMinimum,std::min(32,value));
+}
+__declspec(naked) void analogThrottleStub() {   // entered by a jump in place of "mov [0x603664],0x20" followed by "ret"
+    __asm {
+        push ecx
+        push edx
+        call analogThrottleValue
+        pop edx
+        pop ecx
+        mov ecx,dword ptr [throttleVariable]
+        mov dword ptr [ecx],eax
+        ret
+    }
+}
 void __fastcall playVideoHook(const char* name,int second,int argument) {
     if(gpu.ready()){gpu.releaseWindow();status("video: Direct3D swap chain released");}
     VideoSkipState skip{GetCurrentThreadId(),0};
@@ -1894,6 +2959,60 @@ bool initialize(HMODULE module) {
         if(hookImport(0x61c0b8,L"comdlg32.dll","GetSaveFileNameA",reinterpret_cast<void*>(&getSaveFileNameHook),&original))originalSaveFile=reinterpret_cast<OpenFileFn>(original);
     }
     {
+        InitializeCriticalSection(&quietLock);InitializeCriticalSection(&soundLock);
+        void* original=nullptr;   // the game opens every sound effect with mmioOpenA (one call site, 0x42900d)
+        if(hookImport(0x61c868,L"winmm.dll","mmioOpenA",reinterpret_cast<void*>(&mmioOpenHook),&original))originalMmioOpen=reinterpret_cast<MmioOpenFn>(original);
+        else {quietEffects=false;soundWatch=false;status("louder pedestrians ignored: unexpected import table");}
+        original=nullptr;         // DirectSoundCreate: its buffers are matched with the effect files
+        if(soundWatch && hookImport(0x61c118,L"dsound.dll","DirectSoundCreate",reinterpret_cast<void*>(&directSoundCreateHook),&original))originalDirectSoundCreate=reinterpret_cast<DirectSoundCreateFn>(original);
+        else soundWatch=false;
+        if(soundWatch) {   // the 23 calls of the play thunk; each is verified (E8 to 0x40136b) before it is redirected
+            static const uintptr_t sites[]={0x44794b,0x447a26,0x447a7e,0x447ac9,0x447b14,0x447b5f,0x447baa,0x447bfc,0x447c4e,0x447ca0,0x447ceb,0x447d36,
+                                            0x447d81,0x447daf,0x447df4,0x447e3a,0x447e94,0x447f95,0x447fe5,0x448021,0x4482f6,0x4483b8,0x44845c};
+            playThunk=base+0x40136b-0x400000;
+            int redirected=0;
+            for(uintptr_t site:sites) {
+                if(at<uint8_t>(site)==0xe8 && uintptr_t(intptr_t(site+5)+at<int32_t>(site+1))==0x40136b)
+                    if(branch(site,reinterpret_cast<void*>(&playRequestStub),0xe8))++redirected;
+            }
+            char m[100];std::snprintf(m,sizeof m,"sound: %d of 23 play-request call sites are logged",redirected);status(m);
+            static const uintptr_t eventSites[]={0x412f67,0x412fcf,0x412ff1,0x413c2d,0x413fd3,0x414169,0x414423,0x416adc,0x416b55,0x417a3f,0x418d89,0x419003,
+                                                 0x41a36e,0x41a9e0,0x41bc6b,0x41bcda,0x41bd3e,0x4460a0,0x4460b6,0x446a6a,0x446aed,0x446b2d,0x44b794,0x44bc01,
+                                                 0x44db49,0x45516c,0x455239,0x455847,0x46a648};
+            eventThunk=base+0x402a6d-0x400000;
+            int queued=0;
+            for(uintptr_t site:eventSites) {
+                if(at<uint8_t>(site)==0xe8 && uintptr_t(intptr_t(site+5)+at<int32_t>(site+1))==0x402a6d)
+                    if(branch(site,reinterpret_cast<void*>(&soundEventStub),0xe8))++queued;
+            }
+            std::snprintf(m,sizeof m,"sound: %d of 29 event call sites are logged",queued);status(m);
+            pedestrianThunk=base+0x4013d9-0x400000;
+            int looked=0;
+            for(uintptr_t site:{uintptr_t(0x455143),uintptr_t(0x455210)}) {
+                if(at<uint8_t>(site)==0xe8 && uintptr_t(intptr_t(site+5)+at<int32_t>(site+1))==0x4013d9)
+                    if(branch(site,reinterpret_cast<void*>(&pedestrianLookupStub),0xe8))++looked;
+            }
+            // the second reaction of a walking pedestrian (0x45581e) is made in another function that keeps the pedestrian in ebx
+            if(at<uint8_t>(0x45581e)==0xe8 && uintptr_t(intptr_t(0x45581e+5)+at<int32_t>(0x45581e+1))==0x4013d9)
+                if(branch(0x45581e,reinterpret_cast<void*>(&pedestrianLookupStubB),0xe8))++looked;
+            for(uintptr_t site:{uintptr_t(0x454ff3),uintptr_t(0x455009),uintptr_t(0x455c86),uintptr_t(0x455c9b)}) {
+                if(at<uint8_t>(site)==0xe8 && uintptr_t(intptr_t(site+5)+at<int32_t>(site+1))==0x4013d9)
+                    if(branch(site,reinterpret_cast<void*>(&animationLookupStub),0xe8))++looked;
+            }
+            std::snprintf(m,sizeof m,"sound: %d of 7 pedestrian lookups are logged",looked);status(m);
+            {   // the pedestrian reaction is a virtual method: its table entry is wrapped
+                void** entry=reinterpret_cast<void**>(base+0x596768-0x400000);
+                if(*entry==reinterpret_cast<void*>(base+0x4550a0-0x400000))patchSlot(entry,0,reinterpret_cast<void*>(&reactionStub),reactionOriginal);
+                status(reactionOriginal?"sound: the pedestrian reaction is watched":"sound: the pedestrian reaction table entry is not as expected");
+                // bytes: 77 4d (ja short to 0x455171), a1 <0x6036e8> (mov eax,[0x6036e8]); five bytes are replaced by the jump
+                if(at<uint8_t>(0x455122)==0x77 && at<uint8_t>(0x455123)==0x4d && at<uint8_t>(0x455124)==0xa1 && at<uint32_t>(0x455125)==uint32_t(base+0x6036e8-0x400000)) {
+                    voiceContinue=base+0x455129-0x400000;voiceFlagContinue=base+0x455136-0x400000;voiceSkip=base+0x455171-0x400000;voiceTimeAddress=base+0x6036e8-0x400000;
+                    status(branch(0x455122,reinterpret_cast<void*>(&flagGirlVoiceStub),0xe9)?"sound: the voice distance check is bypassed for the flag girls":"sound: the voice distance check could not be patched");
+                } else status("sound: the voice distance check is not as expected, not patched");
+            }
+        }
+    }
+    {
         void* original=nullptr;   // the game's own XInputGetState import (it reports a pad with nothing pressed while a dialog is open)
         if(!originalXInputGetState && hookImport(0x61c970,nullptr,nullptr,reinterpret_cast<void*>(&xinputGetStateHook),&original))originalXInputGetState=reinterpret_cast<decltype(originalXInputGetState)>(original);
     }
@@ -1902,6 +3021,28 @@ bool initialize(HMODULE module) {
         if(hookImport(0x61c6a4,L"user32.dll","MessageBoxA",reinterpret_cast<void*>(&messageBoxHook),&original))originalMessageBox=reinterpret_cast<MessageBoxFn>(original);
         else status("controller dialogs ignored: unexpected import table");
     }
+    if(analogThrottle && !throttleSpeedMode) {
+        // 46bf0f: mov dword ptr [0x603664],0x20 ; ret   (c7 05 <address> 20 00 00 00 c3)
+        bool match=at<uint8_t>(0x46bf0f)==0xc7 && at<uint8_t>(0x46bf10)==0x05 && at<uint32_t>(0x46bf11)==uint32_t(base+0x603664-0x400000) &&
+                   at<uint32_t>(0x46bf15)==0x20 && at<uint8_t>(0x46bf19)==0xc3;
+        if(match) {
+            throttleVariable=base+0x603664-0x400000;
+            // 46307a: cmp byte [ebp-0x11],0x1e (right trigger above 30 = button 8 pressed); 46307e: jbe +6; or edx,0x80. The limit becomes ThrottleThreshold.
+            if(at<uint8_t>(0x46307a)==0x80 && at<uint8_t>(0x46307b)==0x7d && at<uint8_t>(0x46307c)==0xef && at<uint8_t>(0x46307d)==0x1e && at<uint8_t>(0x46307e)==0x76) {
+                uint8_t limit=uint8_t(throttleThreshold);
+                status(writeMemory(base+0x46307d-0x400000,&limit,1)?"right trigger threshold lowered":"right trigger threshold could not be lowered");
+            } else status("right trigger threshold skipped: the pad code is not as expected");
+            status(branch(0x46bf0f,reinterpret_cast<void*>(&analogThrottleStub),0xe9)?"analog throttle installed (right trigger)":"analog throttle could not be installed");
+        } else status("analog throttle skipped: the pad button handler is not as expected");
+    }
+    if(fixPunchShadow) {
+        const uint8_t expect[6]={0xb8,0x01,0x00,0x00,0x00,0xc3};   // end of the sprite loader: mov eax,1 / ret
+        bool match=true;for(int i=0;i<6;++i)match=match && at<uint8_t>(0x458e6e+i)==expect[i];
+        if(match && at<uint32_t>(0x458e05+1)==uint32_t(base+0x5cab58-0x400000)) {
+            status(branch(0x458e6e,reinterpret_cast<void*>(&punchShadowStub),0xe9)?"punch shadow fix installed":"punch shadow fix could not be installed");
+        } else status("punch shadow fix skipped: the sprite loader is not as expected");
+    }
+    installHidAndWindowFixes();
     if(fixSteering) {
         const uint8_t expect[8]={0x33,0xc0,0x85,0xd2,0x0f,0x48,0xd0,0x2b};
         bool match=true;for(int i=0;i<8;++i)match=match && at<uint8_t>(0x46bea0+i)==expect[i];
@@ -1972,9 +3113,11 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     if(GetPrivateProfileIntW(L"Performance",L"HighPerformance",1,configPath.c_str())!=0)applyPerformanceProfile();
     gpu.lowLatency=GetPrivateProfileIntW(L"Performance",L"LowLatency",0,configPath.c_str())!=0;
     gpu.allowTearing=gpu.lowLatency;
-    profileEnabled=GetPrivateProfileIntW(L"Graphics",L"Profile",0,configPath.c_str())!=0;
+    profileEnabled=debugInt(L"Profile",0,configPath.c_str())!=0;
     asyncControllerScan=GetPrivateProfileIntW(L"Input",L"AsyncControllerScan",1,configPath.c_str())!=0;
     fixSteering=GetPrivateProfileIntW(L"Input",L"SymmetricSteering",1,configPath.c_str())!=0;
+    dualSense=GetPrivateProfileIntW(L"Input",L"DualSense",0,configPath.c_str())!=0;
+    dualMonitorUx=GetPrivateProfileIntW(L"Window",L"DualMonitorUX",0,configPath.c_str())!=0;
     padDialogs=GetPrivateProfileIntW(L"Input",L"PadDialogs",1,configPath.c_str())!=0;
     {wchar_t language[16]{};GetPrivateProfileStringW(L"Game",L"Language",L"Auto",language,16,configPath.c_str());
      for(int i=0;i<15;++i)languageSetting[i]=char(language[i]);languageSetting[15]=0;}
@@ -2006,14 +3149,46 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     }
     skipIntro=GetPrivateProfileIntW(L"Game",L"SkipIntro",0,configPath.c_str())!=0;
     fixPostcards=GetPrivateProfileIntW(L"Game",L"FixPostcards",1,configPath.c_str())!=0;
+    fixPunchShadow=fixFloatingBuildings=GetPrivateProfileIntW(L"Game",L"SpriteFixes",1,configPath.c_str())!=0;   // one option for both sprite fixes
+    analogThrottle=GetPrivateProfileIntW(L"Input",L"AnalogThrottle",1,configPath.c_str())!=0;
+    throttleMinimum=std::max(1,std::min(16,int(GetPrivateProfileIntW(L"Input",L"ThrottleMinimum",2,configPath.c_str()))));
+    throttleThreshold=std::max(2,std::min(30,int(GetPrivateProfileIntW(L"Input",L"ThrottleThreshold",14,configPath.c_str()))));
+    governorThreshold=std::max(1,std::min(60,int(GetPrivateProfileIntW(L"Input",L"ThrottleStart",3,configPath.c_str()))));
+    {
+        wchar_t text[32];
+        GetPrivateProfileStringW(L"Input",L"ThrottleCurve",L"1.0",text,32,configPath.c_str());throttleCurve=std::max(1.0,std::min(4.0,_wtof(text)));
+        GetPrivateProfileStringW(L"Input",L"ThrottleSpeedCurve",L"0.5",text,32,configPath.c_str());governorCurve=std::max(0.2,std::min(3.0,_wtof(text)));
+        GetPrivateProfileStringW(L"Input",L"ThrottleBaseDuty",L"36",text,32,configPath.c_str());governorBaseDuty=std::max(0.0,std::min(100.0,_wtof(text)))/100.0;
+        GetPrivateProfileStringW(L"Input",L"ThrottleMode",L"Speed",text,32,configPath.c_str());throttleSpeedMode=_wcsicmp(text,L"Pressure")!=0;
+        throttleGovernor=analogThrottle && throttleSpeedMode;
+        GetPrivateProfileStringW(L"Input",L"ThrottleTopSpeed",L"4500",text,32,configPath.c_str());throttleTopSpeed=std::max(500.0,std::min(20000.0,_wtof(text)));
+        governorTopSpeed=throttleTopSpeed;
+        GetPrivateProfileStringW(L"Input",L"ThrottleBand",L"700",text,32,configPath.c_str());throttleBand=std::max(100.0,std::min(5000.0,_wtof(text)));
+    }
+    {   // decimal numbers in the ini: read as text
+        wchar_t text[32];
+        GetPrivateProfileStringW(L"Game",L"LowerRedBarn",L"2",text,32,configPath.c_str());lowerRows[0]=std::max(0.0,std::min(40.0,_wtof(text)));
+        GetPrivateProfileStringW(L"Game",L"LowerBrownShop",L"3",text,32,configPath.c_str());lowerRows[1]=std::max(0.0,std::min(40.0,_wtof(text)));
+        GetPrivateProfileStringW(L"Game",L"LowerWhiteHouse",L"10",text,32,configPath.c_str());lowerRows[2]=std::max(0.0,std::min(40.0,_wtof(text)));
+    }
     fixBikeColors=GetPrivateProfileIntW(L"Game",L"FixBikeColors",1,configPath.c_str())!=0;
     keyboardAndPad=GetPrivateProfileIntW(L"Input",L"KeyboardAndPad",1,configPath.c_str())!=0;
     rememberLastSave=GetPrivateProfileIntW(L"Game",L"RememberLastSave",1,configPath.c_str())!=0;
     videoVolume=int(GetPrivateProfileIntW(L"Game",L"VideoVolume",100,configPath.c_str()));
     if(videoVolume<0)videoVolume=0;if(videoVolume>100)videoVolume=100;
     fullRateObjects=GetPrivateProfileIntW(L"Game",L"FullRateObjects",1,configPath.c_str())!=0;
-    dumpEverySeconds=GetPrivateProfileIntW(L"Graphics",L"DumpFrameEverySeconds",0,configPath.c_str());
-    dumpScale=GetPrivateProfileIntW(L"Graphics",L"DumpScale",2,configPath.c_str());
+    quietEffects=GetPrivateProfileIntW(L"Audio",L"LouderPedestrians",1,configPath.c_str())!=0;
+    quietGainDb=std::max(0,std::min(12,int(GetPrivateProfileIntW(L"Audio",L"PedestrianGainDb",3,configPath.c_str()))));
+    pedestrianRelief=std::max(0,std::min(100,int(GetPrivateProfileIntW(L"Audio",L"PedestrianVolumeRelief",60,configPath.c_str()))));
+    pedestrianVoiceRelief=std::max(0,std::min(100,int(GetPrivateProfileIntW(L"Audio",L"PedestrianVoiceRelief",100,configPath.c_str()))));
+    femaleVoiceFallback=GetPrivateProfileIntW(L"Audio",L"FemaleVoiceFallback",1,configPath.c_str())!=0;
+    pedestrianVoiceGapMs=std::max(0,std::min(2000,int(GetPrivateProfileIntW(L"Audio",L"PedestrianVoiceGapMs",120,configPath.c_str()))));
+    voiceRulesOn=GetPrivateProfileIntW(L"Audio",L"PedestrianVoiceRules",1,configPath.c_str())!=0;
+    if(voiceRulesOn)loadVoiceRules();
+    dumpEverySeconds=debugInt(L"DumpFrameEverySeconds",0,configPath.c_str());
+    quadDiagnostics=debugInt(L"QuadDiagnostics",0,configPath.c_str())!=0;
+    smoothHorizon=GetPrivateProfileIntW(L"Graphics",L"SmoothHorizon",0,configPath.c_str())!=0;
+    dumpScale=debugInt(L"DumpScale",2,configPath.c_str());
     windowAltEnter=GetPrivateProfileIntW(L"Window",L"AltEnterFullscreen",1,configPath.c_str())!=0;
     autoHideCursor=GetPrivateProfileIntW(L"Window",L"AutoHideCursor",1,configPath.c_str())!=0;
     startFullscreen=GetPrivateProfileIntW(L"Window",L"StartFullscreen",1,configPath.c_str())!=0;

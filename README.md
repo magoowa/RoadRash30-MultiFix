@@ -1,14 +1,26 @@
 <p align="center"><img src="docs/logo.png" width="420" alt="Road Rash 30 MultiFix"></p>
 
-<p align="center"><b>v2.18.6</b> &nbsp;|&nbsp; <a href="https://github.com/magoowa/RoadRash30-MultiFix/releases/latest"><b>Download the latest release</b></a> &nbsp;|&nbsp; <a href="CHANGELOG.md">Changelog</a></p>
+<p align="center"><b>v2.20.0</b> &nbsp;|&nbsp; <a href="https://github.com/magoowa/RoadRash30-MultiFix/releases/latest"><b>Download the latest release</b></a> &nbsp;|&nbsp; <a href="CHANGELOG.md">Changelog</a></p>
 
 Fixes, widescreen and a Direct3D 11 renderer for **Road Rash: 30th Anniversary Edition** (GOG, EA app and Steam). Authors: **OBLPlife** (original author) and **magoowa**.
 
 A GOG-compatible rework of [OBLPlife/RoadRash30th-HD](https://github.com/OBLPlife/RoadRash30th-HD) for the GOG, EA app and Steam editions.
 
-**`RoadRash95.exe` is never modified.** The patch is a `ddraw.dll` proxy that the game loads from its own folder. It forwards all DirectDraw calls to the real system `ddraw.dll` and loads `RoadRashMultiFix.dll` at startup. The renderer checks the game code before hooking and does nothing on an executable it does not recognize (see `RoadRashHD.log`). Verified with the GOG build `60184028392664413` (SHA-256 `9e40e25737149ab095061b7154797a35495faea97644fafc5a1e616f1400c968`), which is byte-identical to the Steam build 26105967.
+**`RoadRash95.exe` is not modified by the patch.** The only exception is the optional "4 GB Memory" switch in the launcher (one flag in the executable, with a backup, off by default). The patch is a `ddraw.dll` proxy that the game loads from its own folder. It forwards all DirectDraw calls to the real system `ddraw.dll` and loads `RoadRashMultiFix.dll` at startup. The renderer checks the game code before hooking and does nothing on an executable it does not recognize (see `RoadRashHD.log`). Verified with the GOG build `60184028392664413` (SHA-256 `9e40e25737149ab095061b7154797a35495faea97644fafc5a1e616f1400c968`), which is byte-identical to the Steam build 26105967.
 
 ![The MultiFix launcher](docs/launcher.png)
+
+The launcher groups the options in tabs. Here is every tab (the animation below flips through them):
+
+| Stability and QoL | Graphics | Display |
+| :---: | :---: | :---: |
+| ![Stability and QoL](docs/launcher-stability.png) | ![Graphics](docs/launcher-graphics.png) | ![Display](docs/launcher-display.png) |
+
+| Audio | Controls |
+| :---: | :---: |
+| ![Audio](docs/launcher-audio.png) | ![Controls](docs/launcher-controls.png) |
+
+![All launcher tabs](docs/launcher-tabs.gif)
 
 ## Install and Restore
 
@@ -46,6 +58,11 @@ Inherited from the original project: automatic native resolution, native HD re-r
 
 Added in this fork:
 
+- **4 GB Memory (optional):** one switch in the launcher sets the Large Address Aware flag of `RoadRash95.exe` (the 32-bit game then gets up to 4 GB instead of 2 GB, which helps against missing textures and crashes after a few miles). The original is kept as `RoadRash95.exe.multifix-backup`; the launcher shows whether the file is patched and Restore puts it back.
+- **Smooth Road:** the road and its edges no longer jump or pulse as you ride (the half-pixel snapping of the old renderer is removed and the fractions the game drops are added back).
+- **Custom music:** play your own WAV files (CD quality 16-bit 44.1 kHz and 48 kHz work) instead of the game's tracks, with any file names (`[MusicFiles]`) or as a random playlist (`AUDIO\MUSIC\Playlist`). The Audio tab has a help window that explains it.
+- **HUD distance:** the odometer no longer wraps to 0 after 25.5, and an option shows the distance to the finish instead of the distance driven. **Keep completed tracks:** finishing the last level no longer clears the five "track completed" marks of the save.
+- **Crash diagnostics:** `RoadRashHD.log` records free address space, the first fatal exception, frame hitches and how evenly the player moves; unreadable polygons and textures are skipped instead of crashing the game.
 - **No EXE modification:** loads through a `ddraw.dll` proxy; GOG Galaxy "Verify / Repair" does not undo it.
 - **Installer and launcher:** detects GOG, EA app and Steam installations, shows the executable version, has one row per option (read from and saved to `RoadRashHD.ini` live), a **Play** button, detection of the MultiFix installation and its DLL version in the game folder (if it is missing or outdated, Play asks whether to install/update first; Yes or No, the game starts either way), backup/restore, HiDPI-safe layout and a custom icon.
 - **Pedestrian sounds:** new voices and collision reactions for every kind of pedestrian (including the flag girls and the people at the start), and pedestrians that are no longer far quieter than the rider.
@@ -55,7 +72,7 @@ Added in this fork:
 - **Stutter Fix:** the controller scan that froze the game for ~165 ms every two seconds now runs in the background.
 - **Windowed mode from the game menu** keeps the configured window size (`[Window] Width/Height` or automatic 16:9) instead of switching to 4:3.
 - **Netplay download:** the launcher shows whether `wsock32.dll` (OKPlay) is in the game folder. If not, the **download netplay** link fetches the newest package from oldkid.net (OKPlay GitHub release as fallback) and unpacks `netcheck.exe`, `okplay.ini` (an existing one is kept), `wsock32.dll` and `oldkid_netplay_readme.txt` into the game folder.
-- **Muted Sound Fix:** with the music slider at 0 in the Sound Mix screen only the music is muted; the game is no longer silenced in the Windows volume mixer (launcher option).
+- **Muted Sound Fix:** the MIDI music follows the music slider of the Sound Mix screen as a percentage (0 % is silent, 5 % is quiet, 100 % is a safe ceiling; it ignored the slider before) and a slider at 0 no longer silences the whole game in the Windows volume mixer (launcher option).
 - **FMV Volume:** a slider in the launcher sets the volume of all intro and story videos (.avi and .mp4), 0-100 %.
 - **Fix Bike Colors:** the Rat and Super bikes have each other's colours in the race (the shop pictures are right); the two groups of five colour tables are swapped back (the same change as Anakin94's fix for the 1996 exe). Thanks to Anakin94 and peemosa for finding the bug.
 - **Fix Text Encoding:** Unicode text the game misreads (the trademark sign shown as `â„¢`, curly quotes, accents) is displayed correctly even with Windows' UTF-8 system code page.
@@ -96,7 +113,7 @@ All options are in `RoadRashHD.ini` (game folder) and in the installer/launcher 
 | `[Text]` | `FixEncoding` | 1 | Fixes garbled special characters (for example `Rashâ„¢` instead of the trademark sign, or `â€œEnderâ€` instead of curly quotes). The game reads its strings with `LoadStringA`, which returns UTF-8 when Windows uses the "Use Unicode UTF-8 for worldwide language support" setting, while the game's bitmap font expects Windows-1252. |
 | `[Input]` | `KeyboardAndPad` | 1 | Keyboard and controller work at the same time, whatever control device the loaded profile has selected (the original game reads only the selected one); missing pad assignments of a keyboard profile are filled in with the game's defaults. Launcher: **Keyboard + Controller Together**. |
 | `[Input]` | `AsyncControllerScan` | 1 | Stutter fix: searches for controllers in a background thread. On the game thread it opened every HID device every two seconds, and one slow device froze the game for ~165 ms (credits, menus, races). |
-| `[Input]` | `DualSense` | 0 | Experimental, untested without the pad (issue #4): a DualSense or DualShock 4 over HID: Bluetooth reports are understood and the d-pad steers and chooses in the menus (diagonals too). The fix for a native DualSense that scrolled the menus upward by itself is always on. |
+| `[Input]` | `DualSense` | 0 | A DualSense or DualShock 4 over HID (issue #4, confirmed working by a player with the pad): Bluetooth reports are understood and the d-pad steers and chooses in the menus (diagonals too). The fix for a native DualSense that scrolled the menus upward by itself is always on. |
 | `[Input]` | `SymmetricSteering` | 1 | Analog stick steering: right turn is as gentle as left (the original mapping made right about twice as sensitive). |
 | `[Game]` | `Language` | Auto | Game text language: `Auto` (the game's own setting), `English`, `French`, `German`, `Italian` or `Spanish`. Needs the matching DLL in the game's TEXT folder. |
 | `[Input]` | `PadDialogs` | 1 | The controller answers the game's message boxes (A = OK / Yes, B = Cancel / No), for example the quit confirmation. Skipping videos and the Race Resolution dialog work with the controller regardless of this option. |
@@ -105,17 +122,25 @@ All options are in `RoadRashHD.ini` (game folder) and in the installer/launcher 
 | `[Game]` | `FixPostcards` | 1 | Repairs the broken left strip of the GAME LOADING picture. |
 | `[Game]` | `SpriteFixes` | 1 | Sprite fixes: the shadow of the first frame of the punch (drawn far from the bike in the original game) and the buildings that hover above the ground (red barn, brown wooden shop with the sign, white house), which are lowered. Tuned with `LowerRedBarn`, `LowerBrownShop`, `LowerWhiteHouse`. |
 | `[Game]` | `LowerRedBarn` / `LowerBrownShop` / `LowerWhiteHouse` | 2 / 3 / 10 | How far the red barn, the brown wooden shop with the sign and the white house are lowered, in rows of their full-size picture (decimals allowed). |
+| `[Game]` | `SmoothRoad` | 1 | Smooth road: removes the half-pixel snapping of the road and its edges and adds back the fractions of elevation and bend the game drops when it projects the track, so the road and the curbs do not jump or pulse. |
+| `[Game]` | `DistanceToFinish` | 0 | The HUD distance counts down to the finish line (course length of the track menu minus the distance driven) instead of up from the start. The odometer no longer wraps to 0 at 25.5, whatever this is set to. |
+| `[Game]` | `KeepCompletedTracks` | 1 | After the last level is finished the five "track completed" marks of the save stay set (the game clears them and shows the ending). Side effect: the ending is probably shown again after each later win; 0 = the game's own behaviour. |
 | `[Game]` | `FixBikeColors` | 1 | Gives the Rat and Super bikes their correct colours in the race. |
 | `[Game]` | `SkipIntro` | 0 | Skips the studio logos and the intro movie; the menu music still plays. |
 | `[Game]` | `RememberLastSave` | 1 | The Load Game dialog opens with the save used last already selected (`LastSave`, written by the game). The controller works the Open / Save as dialogs: D-pad up / down choose, A opens, B cancels (`[Input] PadDialogs`). |
 | `[Audio]` | `PedestrianVoiceRules` | 1 | Each kind of pedestrian shouts with its own pool of voices (table: `PedestrianVoices.ini`, editable); flag girls and the people at the start react to a collision too. |
+| `[Audio]` | `PedestrianLoudness` | 67 | How much of the pedestrian boost is applied, in percent (launcher: Pedestrian Loudness slider): 100 = the full boost of earlier versions, 67 = two thirds of it (default), 0 = the game's own levels. `LouderPedestrians=0` still switches the boost off. |
 | `[Audio]` | `LouderPedestrians` | 1 | The voices of people other than the rider (bystanders, bikers, tourists, skaters, cyclists, cops) and the footsteps are made louder. The game plays them at a fixed -17.6 dB. A louder copy is made once in `%LOCALAPPDATA%\RoadRashMultiFix\audio` from the game's own files, which are never changed. |
 | `[Audio]` | `PedestrianGainDb` | 3 | How much louder the sounds themselves are, in dB (0-12); the footsteps get twice as much again. |
 | `[Audio]` | `PedestrianVolumeRelief` | 60 | Reduces the attenuation the game applies to those sounds, in percent (0 = as the game sets it, 100 = none). |
 | `[Audio]` | `PedestrianVoiceRelief` | 100 | The same for the pedestrians' voices alone (not the thump or the footsteps); 100 = as loud as the rider's own sounds. |
 | `[Audio]` | `FemaleVoiceFallback` | 1 | The woman pedestrian that has no voice in the game's data gets the unused voices `FG1_WATC` / `FG2_EEK`. |
 | `[Audio]` | `PedestrianVoiceGapMs` | 120 | Minimum time in milliseconds between two first-reaction voices of pedestrians (0 = no limit). |
-| `[Audio]` | `MidiVolumeGuard` | 1 | A MIDI music volume of 0 (Sound Mix: Master x Game music) is not passed to Windows (launcher: Muted Sound Fix). On some Windows versions that call changes the volume of the whole game in the volume mixer and Windows remembers it, so the game had no sound at all, even after a restart. |
+| `[Audio]` | `MidiVolumeGuard` | 1 | The MIDI music level of the Sound Mix screen (master x game music) is applied to the MIDI notes (0 % = silent) and the MIDI volume is not sent to Windows (launcher: Muted Sound Fix). Many MIDI devices ignore the volume the game sets, and on some Windows versions a volume of 0 changes the volume of the whole game in the volume mixer and Windows remembers it. |
+| `[Audio]` | `MusicWavFiles` | 0 | A `MUSIC\NAME.WAV` (any PCM WAV, for example 16-bit 44.1 kHz CD quality) next to `MUSIC\NAME.RRA` is played instead of it (launcher: WAV Music Replacement). The game's stream buffer is rounded to whole sample frames, which a 16-bit file needs: without it the music turned into noise a few seconds in. |
+| `[MusicFiles]` | `TRACK=file` | - | With WAV Music Replacement: plays any WAV instead of an original track, e.g. `T_TEETH=my remaster.wav` (a name in `AUDIO\MUSIC`, a path relative to the game folder or a full path). The 14 tracks are listed in the ini; a track without a line plays `TRACK.WAV` when that exists. |
+| `[Audio]` | `MusicPlaylist` | 0 | With WAV Music Replacement: every WAV (PCM 8/16-bit, any sample rate) in `AUDIO\MUSIC\Playlist` is music for the game; each time the game starts a piece of music it gets the next WAV, in random order without repeats (`MusicPlaylistShuffle=0`: by file name). Tracks with their own `[MusicFiles]` line or `TRACK.WAV` keep it. `MusicPlaylistFolder` picks another folder (relative to the game folder or a full path; launcher: Music Playlist). |
+| `[Audio]` | `MidiMaxPercent` | 70 | With Muted Sound Fix: how loud the MIDI music is at a music level of 100 % (10-100; 100 = the original note velocities). 5 % of the slider plays at 10 % of the velocity. |
 | `[Game]` | `VideoVolume` | 100 | Volume of all videos (.avi and .mp4) in percent of the game's volume (launcher: FMV Volume slider). |
 
 Advanced options, not shown in the launcher (add them to the ini):

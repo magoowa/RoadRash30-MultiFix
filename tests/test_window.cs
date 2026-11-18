@@ -98,17 +98,18 @@ internal static class WindowTest
                 {
                     var rootPanel = window.Controls.Find("RootPanel", true)[0];
                     int edge = rootPanel.Padding.Left;
-                    foreach (string name in new[] { "HeadTable", "OptionsLabel", "OptionsTable", "FooterTable" })
+                    foreach (string name in new[] { "HeadTable", "LaaBlock", "OptionsTabs", "FooterTable" })
                     {
                         var c = window.Controls.Find(name, true);
                         if (c.Length != 1) throw new InvalidOperationException("Missing control " + name);
                         if (c[0].Left != edge) throw new InvalidOperationException(name + " must start at the common margin (" + edge + "), starts at " + c[0].Left);
                     }
-                    {   // the credits sit in the columns of the options: names under the option names, text under the descriptions
-                        var line = window.Controls.Find("VideoVolumeLine", true)[0]; 
-                        var info = window.Controls.Find("InstallPanel", true)[0];
-                        bool oneColumn = (bool)window.GetType().GetField("compact", BindingFlags.NonPublic | BindingFlags.Instance).GetValue(window);   // narrow screen: the options are one column
-                        if (!oneColumn && info.PointToScreen(Point.Empty).X != line.PointToScreen(Point.Empty).X) throw new InvalidOperationException("The installations block must start on the description column (" + info.PointToScreen(Point.Empty).X + " vs " + line.PointToScreen(Point.Empty).X + ")");
+                    {   // the options are in tabs, Stability first; the sliders live in the Audio tab
+                        var tabControl = (TabControl)window.Controls.Find("OptionsTabs", true)[0];
+                        if (tabControl.TabPages.Count != 5 || tabControl.TabPages[0].Text != "Stability and QoL") throw new InvalidOperationException("The first tab must be Stability and QoL, there must be 5 tabs");
+                        if (window.Controls.Find("Slider_Game_VideoVolume", true).Length != 1 || window.Controls.Find("Slider_Audio_PedestrianLoudness", true).Length != 1) throw new InvalidOperationException("The FMV and pedestrian loudness sliders are missing");
+                        if (window.Controls.Find("LaaBox", true).Length != 1) throw new InvalidOperationException("The 4 GB switch is missing");
+                        if (window.Controls.Find("AboutLabel", true).Length != 0) throw new InvalidOperationException("The footer about text must be gone");
                     }
                     var bar0 = window.Controls.Find("ButtonBar", true)[0]; var buttons0 = window.Controls.Find("PlayButton", true)[0].Parent;
                     if (buttons0.Left != bar0.Padding.Left || bar0.Padding.Left != edge) throw new InvalidOperationException("The buttons must use the same margin as the content (buttons " + buttons0.Left + ", bar padding " + bar0.Padding.Left + ", content " + edge + ")");
@@ -334,6 +335,40 @@ internal static class WindowTest
                     execute.Invoke(null, new object[] { false, game, null });
                     execute.Invoke(null, new object[] { true, game, null });
                     if (!describe().StartsWith("NOT installed")) throw new InvalidOperationException("After Restore the folder must report NOT installed, got: " + describe());
+                }
+                finally { try { Directory.Delete(game, true); } catch (Exception) { } }
+            }
+            // The 4 GB (Large Address Aware) switch and the installed netplay version, in a throw-away folder.
+            {
+                string game = Path.Combine(Path.GetTempPath(), "rrmf_laa_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(game);
+                try
+                {
+                    var pe = new byte[0x400];
+                    pe[0] = 0x4d; pe[1] = 0x5a; pe[0x3c] = 0x80; pe[0x80] = (byte)'P'; pe[0x81] = (byte)'E'; pe[0x84] = 0x4c; pe[0x85] = 0x01; pe[0x96] = 0x02; pe[0x97] = 0x01;
+                    string exe = Path.Combine(game, "RoadRash95.exe"); File.WriteAllBytes(exe, pe);
+                    var type = assembly.GetType("Installer");
+                    var laa = type.GetMethod("Laa", BindingFlags.Public | BindingFlags.Static);
+                    var setLarge = type.GetMethod("SetLarge", BindingFlags.Public | BindingFlags.Static);
+                    Func<string, bool> flag = name => { object s = laa.Invoke(null, new object[] { game }); return (bool)s.GetType().GetField(name).GetValue(s); };
+                    if (!flag("Valid") || flag("Patched") || flag("BackupExists")) throw new InvalidOperationException("A fresh 32-bit executable must be valid, not patched, without a backup");
+                    if (Environment.Is64BitOperatingSystem)
+                    {
+                        string error = (string)setLarge.Invoke(null, new object[] { game, true });
+                        if (error != null || !flag("Patched") || !flag("BackupExists")) throw new InvalidOperationException("Enabling the 4 GB switch failed: " + error);
+                        var patched = File.ReadAllBytes(exe);
+                        for (int i = 0; i < pe.Length; ++i)
+                            if (i != 0x96 && patched[i] != pe[i]) throw new InvalidOperationException("The 4 GB switch changed a byte other than the flag (offset " + i + ")");
+                        if ((patched[0x96] & 0x20) == 0 || patched[0x96] != (pe[0x96] | 0x20)) throw new InvalidOperationException("The Large Address Aware flag was not set");
+                        if (!File.Exists(Path.Combine(game, "RoadRash95.exe.multifix-backup")) || File.ReadAllBytes(Path.Combine(game, "RoadRash95.exe.multifix-backup"))[0x96] != pe[0x96]) throw new InvalidOperationException("The backup must hold the original");
+                        error = (string)setLarge.Invoke(null, new object[] { game, false });
+                        var restored = File.ReadAllBytes(exe);
+                        if (error != null || flag("Patched") || flag("BackupExists")) throw new InvalidOperationException("Disabling the 4 GB switch failed: " + error);
+                        for (int i = 0; i < pe.Length; ++i) if (restored[i] != pe[i]) throw new InvalidOperationException("Disabling the 4 GB switch must restore the original (offset " + i + ")");
+                    }
+                    File.WriteAllText(Path.Combine(game, "oldkid_netplay_readme.txt"), "Oldkid.net Online Play  v0.8.5\r\nClassic Netplay\r\n");
+                    var netplayVersion = (string)type.GetMethod("NetplayVersion", BindingFlags.Public | BindingFlags.Static).Invoke(null, new object[] { game });
+                    if (netplayVersion != "0.8.5") throw new InvalidOperationException("The installed netplay version must be read from its readme, got " + netplayVersion);
                 }
                 finally { try { Directory.Delete(game, true); } catch (Exception) { } }
             }

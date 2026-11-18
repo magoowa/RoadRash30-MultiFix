@@ -11,13 +11,18 @@
 #include <mmsystem.h>
 #include <dsound.h>
 #include <map>
+#include <deque>
 #include <string>
 #include <cstdio>
 #include <intrin.h>
 #include <array>
 #include <unordered_map>
+#include <mutex>
+#include <random>
+#include <algorithm>
 #include "hd_raster.hpp"
 #include "hd_geometry.hpp"
+#include "hd_wav.hpp"
 #include "hd_gpu.hpp"
 #include "hd_version.hpp"
 
@@ -688,6 +693,62 @@ void status(const char* message) {
     FILE* f=nullptr;
     if(_wfopen_s(&f,logPath.c_str(),L"a")==0 && f) { std::fprintf(f,"%s\n",message);std::fclose(f); }
 }
+// Crash and resource diagnostics (always on, cheap). The game is a 32-bit program that is not large-address-aware: it has 2 GB of address space for
+// itself, the Direct3D driver and this DLL, and running out of it shows as missing textures and then a crash. The log gets a "memory:" line every
+// 30 s, the first fatal exception (access violation, stack overflow, heap corruption...) with its address, module and registers, and the quads that
+// could not be drawn because a texture did not fit.
+std::string memoryReport() {
+    SYSTEM_INFO si{};GetSystemInfo(&si);
+    uintptr_t address=uintptr_t(si.lpMinimumApplicationAddress);const uintptr_t end=uintptr_t(si.lpMaximumApplicationAddress);
+    size_t priv=0,image=0,mapped=0,freeTotal=0,largest=0,regions=0;
+    MEMORY_BASIC_INFORMATION info{};
+    while(address<end && VirtualQuery(reinterpret_cast<void*>(address),&info,sizeof info)) {
+        if(info.State==MEM_FREE){freeTotal+=info.RegionSize;largest=std::max<size_t>(largest,info.RegionSize);}
+        else if(info.State==MEM_COMMIT){if(info.Type==MEM_PRIVATE)priv+=info.RegionSize;else if(info.Type==MEM_IMAGE)image+=info.RegionSize;else mapped+=info.RegionSize;}
+        ++regions;
+        const uintptr_t next=uintptr_t(info.BaseAddress)+info.RegionSize;
+        if(next<=address)break;
+        address=next;
+    }
+    MEMORYSTATUSEX ms{};ms.dwLength=sizeof ms;GlobalMemoryStatusEx(&ms);
+    char text[260];
+    std::snprintf(text,sizeof text,"private %zu MB, image %zu MB, mapped %zu MB, free address space %zu MB (largest block %zu MB), address space %zu MB, system RAM free %llu MB, %zu regions",
+        priv>>20,image>>20,mapped>>20,freeTotal>>20,largest>>20,size_t(end>>20),(unsigned long long)(ms.ullAvailPhys>>20),regions);
+    return text;
+}
+void logMemoryEvery30Seconds() {
+    static ULONGLONG last=0;
+    const ULONGLONG now=GetTickCount64();
+    if(last && now-last<30000)return;
+    last=now;
+    char m[360];std::snprintf(m,sizeof m,"memory: %s",memoryReport().c_str());status(m);
+}
+uint64_t quadsSkipped=0;int lastSkippedW=0,lastSkippedH=0;bool lastSkippedTransient=false;
+HMODULE ownModule=nullptr;
+thread_local int probeDepth=0;     // > 0 inside one of the deliberate memory probes below (readInt, readMemory, ...): their access violations are expected
+LONG CALLBACK crashLogger(PEXCEPTION_POINTERS info) {
+    const DWORD code=info->ExceptionRecord->ExceptionCode;
+    const bool fatal=code==0xC0000005 || code==0xC00000FD || code==0xC0000374 || code==0xC0000409 || code==0xC000001D || code==0xC0000094 || code==0xC0000096 || code==0xC0000026;
+    if(!fatal)return EXCEPTION_CONTINUE_SEARCH;
+    HMODULE module=nullptr;char name[MAX_PATH]="?";
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCSTR>(info->ExceptionRecord->ExceptionAddress),&module);
+    if(probeDepth>0)return EXCEPTION_CONTINUE_SEARCH;            // a deliberate probe of unreadable memory (caught by its own handler)
+    if(module)GetModuleFileNameA(module,name,MAX_PATH);
+    static volatile LONG logged=0;
+    if(InterlockedIncrement(&logged)>8)return EXCEPTION_CONTINUE_SEARCH;
+    const char* file=std::strrchr(name,'\\');file=file?file+1:name;
+    const CONTEXT* c=info->ContextRecord;
+    char m[700];
+    std::snprintf(m,sizeof m,"exception 0x%08lx at 0x%08lx (%s+0x%lx), %s 0x%08lx, eax %08lx ebx %08lx ecx %08lx edx %08lx esi %08lx edi %08lx ebp %08lx esp %08lx, frame %llu, GPU quads skipped %llu",
+        code,unsigned long(reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress)),file,
+        unsigned long(reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress)-reinterpret_cast<uintptr_t>(module)),
+        code==0xC0000005?(info->ExceptionRecord->ExceptionInformation[0]==1?"write to":info->ExceptionRecord->ExceptionInformation[0]==8?"execute at":"read from"):"info",
+        code==0xC0000005?unsigned long(info->ExceptionRecord->ExceptionInformation[1]):0ul,
+        c->Eax,c->Ebx,c->Ecx,c->Edx,c->Esi,c->Edi,c->Ebp,c->Esp,(unsigned long long)frames,(unsigned long long)quadsSkipped);
+    status(m);
+    char mem[360];std::snprintf(mem,sizeof mem,"memory at the exception: %s",memoryReport().c_str());status(mem);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 // Optional frame-time profiling (RoadRashHD.ini: Profile=1). Logs every five
 // seconds: average time per stage and the distribution of presented-frame
 // intervals, which is what a viewer perceives as stutter.
@@ -856,11 +917,27 @@ uint8_t* __fastcall animationFrameHook(uint8_t* animation,int sequence,int frame
     }
     return fn<AnimationFrame>(0x41be80)(animation,sequence,frame,duration);
 }
+// Every write into the game's code is remembered (address and the bytes that were there), so a patch group that fails half way can be undone.
+struct PatchRecord {uintptr_t address;std::vector<uint8_t> original;};
+std::vector<PatchRecord> patchJournal;bool journaling=false;     // only the installation in initialize() is journaled
 bool writeMemory(uintptr_t address,const void* bytes,size_t length) {
     void* dest=reinterpret_cast<void*>(address);DWORD oldProtect;
     if(!VirtualProtect(dest,length,PAGE_EXECUTE_READWRITE,&oldProtect)) return false;
+    if(journaling)patchJournal.push_back({address,std::vector<uint8_t>(static_cast<uint8_t*>(dest),static_cast<uint8_t*>(dest)+length)});
     std::memcpy(dest,bytes,length);FlushInstructionCache(GetCurrentProcess(),dest,length);
     DWORD ignored;VirtualProtect(dest,length,oldProtect,&ignored);return true;
+}
+void rollbackPatches(size_t mark,const char* what) {
+    size_t undone=0;
+    while(patchJournal.size()>mark) {
+        PatchRecord record=std::move(patchJournal.back());patchJournal.pop_back();
+        void* dest=reinterpret_cast<void*>(record.address);DWORD oldProtect;
+        if(VirtualProtect(dest,record.original.size(),PAGE_EXECUTE_READWRITE,&oldProtect)) {
+            std::memcpy(dest,record.original.data(),record.original.size());FlushInstructionCache(GetCurrentProcess(),dest,record.original.size());
+            DWORD ignored;VirtualProtect(dest,record.original.size(),oldProtect,&ignored);++undone;
+        }
+    }
+    char m[160];std::snprintf(m,sizeof m,"%s: a patch failed, %zu changes undone",what,undone);status(m);
 }
 // Log and troubleshooting keys all live in [Debug]; the old place ([Graphics], used by 2.17.3 for Profile) is still read when [Debug] has no value.
 UINT debugInt(const wchar_t* key,int def,const wchar_t* file) {
@@ -969,6 +1046,9 @@ void ensurePadAssignments() {
     if(changed && !logged){logged=true;status("input: pad assignments added to a keyboard profile");}
 }
 int __cdecl frameHook() {
+    logMemoryEvery30Seconds();
+    {static uint64_t reported=0;static ULONGLONG when=0;const ULONGLONG now=GetTickCount64();
+     if(quadsSkipped!=reported && now-when>5000){when=now;char m[200];std::snprintf(m,sizeof m,"gpu: %llu quads in total could not be drawn (last texture %dx%d, %s)",(unsigned long long)quadsSkipped,lastSkippedW,lastSkippedH,lastSkippedTransient?"per-frame atlas full":"too large");status(m);reported=quadsSkipped;}}
     if(keyboardAndPadActive)ensurePadAssignments();
     if(!highMode() || !windowViewport()) { worldReady=false;displayReady=false;return fn<DrawList>(0x45ac50)(); }
     LARGE_INTEGER begin{},end{},frequency{};QueryPerformanceCounter(&begin);
@@ -980,6 +1060,44 @@ int __cdecl frameHook() {
     QueryPerformanceCounter(&end);QueryPerformanceFrequency(&frequency);
     static LONGLONG interval=0,total=0,lastEnd=0;static unsigned samples=0;
     if(!interval || begin.QuadPart-lastEnd>frequency.QuadPart/2) {interval=begin.QuadPart;total=0;samples=0;}
+    // Hitch log: a gap between two frames of more than 25 ms (a frame is 16.7 ms), how much of it was the game's own frame work
+    // (inside this hook) and where on the course it happened. Summed up with the cadence line; the first 40 are logged one by one.
+    {
+        static LONGLONG previousBegin=0;static unsigned hitches=0,logged=0;static double worstGap=0,worstWork=0;
+        const double gap=previousBegin&&begin.QuadPart-previousBegin<frequency.QuadPart*2?(begin.QuadPart-previousBegin)*1000.0/frequency.QuadPart:0;
+        const double work=(end.QuadPart-begin.QuadPart)*1000.0/frequency.QuadPart;
+        previousBegin=begin.QuadPart;
+        if(gap>25.0) {
+            ++hitches;if(gap>worstGap){worstGap=gap;worstWork=work;}
+            if(logged<40) {
+                ++logged;const uintptr_t player=at<uintptr_t>(0x5a69ec);int position=-1;if(player && readInt(reinterpret_cast<const void*>(player+0x44),&position))position>>=8;else position=-1;
+                char m[200];std::snprintf(m,sizeof m,"hitch: %.1f ms between frames, %.1f ms of it in the game's frame work, track position %d",gap,work,position);status(m);
+            }
+        }
+        // Motion log: how far the player advanced along the track between two frames. A game that moves in uneven steps (frames
+        // without movement, steps far from the average) looks jerky at a perfect 60 fps.
+        {
+            static int lastPos=0;static bool have=false;static double average=0;static unsigned moving=0,still=0,irregular=0;
+            const uintptr_t player=at<uintptr_t>(0x5a69ec);
+            if(player) {
+                int pos=0;const bool readable=readInt(reinterpret_cast<const void*>(player+0x44),&pos);
+                if(!readable)have=false;
+                else if(have && gap>0 && gap<60) {
+                    const double step=double(pos-lastPos);
+                    if(average>20.0) {++moving;if(step==0)++still;else if(step<average*0.5||step>average*1.5)++irregular;}
+                    average=average*0.9+step*0.1;
+                }
+                if(readable){lastPos=pos;have=true;}
+            } else have=false;
+            if(end.QuadPart-interval>=frequency.QuadPart*5 && moving>60) {
+                char m[200];std::snprintf(m,sizeof m,"motion in the last 5 s: %u frames while moving, %u without any movement, %u with a step 50%% off the average (average %.0f units)",moving,still,irregular,average);
+                status(m);moving=still=irregular=0;
+            }
+        }
+        if(end.QuadPart-interval>=frequency.QuadPart*5 && hitches){
+            char m[160];std::snprintf(m,sizeof m,"hitches in the last 5 s: %u frames over 25 ms, worst %.1f ms (%.1f ms in the game's frame work)",hitches,worstGap,worstWork);status(m);hitches=0;worstGap=worstWork=0;
+        }
+    }
     lastEnd=end.QuadPart;
     total+=end.QuadPart-begin.QuadPart;++samples;
     if(end.QuadPart-interval>=frequency.QuadPart*5) {
@@ -1146,6 +1264,26 @@ void copyLegacyView() {
     }
     worldReady=true;
 }
+// Guards. A polygon of the game's list whose data is not readable (a texture the game has already freed, a damaged node) must not take the
+// whole game down: it is skipped and logged (the first few times). The functions only contain the guarded call, so SEH is allowed here.
+int guardLogged=0;
+void guardNote(const char* what,const void* where) {
+    if(++guardLogged>10)return;
+    char m[160];std::snprintf(m,sizeof m,"guard: unreadable memory while %s (0x%08x), the polygon is skipped",what,unsigned(reinterpret_cast<uintptr_t>(where)));status(m);
+}
+bool drawNodeGuarded(uint8_t* node) {
+    __try {drawNode(node);return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER) {guardNote("drawing a polygon",node);return false;}
+}
+bool nextNodeGuarded(uint8_t* node,uint8_t** next) {
+    ++probeDepth;
+    __try {*next=*reinterpret_cast<uint8_t**>(node);--probeDepth;return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER) {--probeDepth;guardNote("following the polygon list",node);*next=nullptr;return false;}
+}
+bool textureGuarded(const uint8_t* pixels,int w,int h,bool transient,uint32_t& xy,uint32_t& flags,bool& result) {
+    __try {result=gpu.texture(pixels,w,h,transient,xy,flags);return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER) {guardNote("reading a texture",pixels);return false;}
+}
 int __cdecl listHook() {
     if(!frameActive) return fn<DrawList>(0x4688e0)();
     // Retain DirectDraw locking, bypass the legacy 640-pixel cull and raster.
@@ -1153,7 +1291,8 @@ int __cdecl listHook() {
     int result=fn<DrawList>(0x4688e0)();at<uint8_t*>(0x6185e0)=head;
     if(!beginWorld()) return result;
     while(auto node=at<uint8_t*>(0x6185e0)) {
-        drawNode(node);at<uint8_t*>(0x6185e0)=*reinterpret_cast<uint8_t**>(node);
+        drawNodeGuarded(node);
+        uint8_t* next=nullptr;nextNodeGuarded(node,&next);at<uint8_t*>(0x6185e0)=next;
     }
     LONGLONG t0=profileEnabled?profiler.now():0;
     if(gpuFrame) {
@@ -1447,9 +1586,11 @@ bool gpuBuildQuads(std::vector<rrhd::GpuQuad>& quads) {
         for(int i=0;i<4;++i){q.x[i]=float(job.points[i].x);q.y[i]=float(job.points[i].y);q.u[i]=float(job.points[i].u);q.v[i]=float(job.points[i].v);}
         if(job.texture.pixels) {
             uint32_t xy=0,fl=0;
-            if(!gpu.texture(job.texture.pixels,job.texture.width,job.texture.height,job.snapshot!=SIZE_MAX,xy,fl))
+            bool uploaded=false;
+            if(!textureGuarded(job.texture.pixels,job.texture.width,job.texture.height,job.snapshot!=SIZE_MAX,xy,fl,uploaded))uploaded=false;
+            if(!uploaded)
                 if(gpu.staticAtlasFull())return false;   // caller flushes and retries once
-                else continue;                            // oversized texture: skip this quad
+                else {++quadsSkipped;lastSkippedW=job.texture.width;lastSkippedH=job.texture.height;lastSkippedTransient=job.snapshot!=SIZE_MAX;continue;}   // oversized texture or the per-frame atlas is full: skip this quad
             double area=0,umin=job.points[0].u,umax=umin,vmin=job.points[0].v,vmax=vmin;
             for(int i=0;i<4;++i){
                 const auto& a=job.points[i];const auto& b=job.points[(i+1)&3];area+=a.x*b.y-b.x*a.y;
@@ -1844,6 +1985,7 @@ DWORD WINAPI healSessionVolumeThread(LPVOID) {
 // anything that goes wrong falls back to the original file.
 CRITICAL_SECTION soundLock;std::string lastOpenedWav;bool soundWatch=true;
 bool quietEffects=true;double quietGainDb=3.0;
+bool musicWavFiles=false;   // [Audio] MusicWavFiles, see createBufferHook
 CRITICAL_SECTION quietLock;
 std::unordered_map<std::string,std::string> quietDecision;   // lower-case file name -> file to open ("" = the original)
 using MmioOpenFn=HMMIO(WINAPI*)(LPSTR,LPMMIOINFO,DWORD);
@@ -1917,11 +2059,104 @@ std::string quietCopyFor(const char* path) {
     LeaveCriticalSection(&quietLock);
     return use;
 }
+// Music playlist ([Audio] MusicPlaylist, MusicPlaylistFolder, MusicPlaylistShuffle). Every WAV in AUDIO\MUSIC\Playlist (or the folder in the ini) is a track
+// for the game's music: each time the game starts a piece of music it gets the next WAV of the folder, in random order without repeats (or in name
+// order). A track that has its own [MusicFiles] line or its own NAME.WAV keeps it. Files that are not PCM 8/16-bit WAVs are skipped.
+bool musicPlaylist=false,musicPlaylistShuffle=true;
+std::string musicPlaylistFolder;                // set from the ini; empty = AUDIO\MUSIC\Playlist next to the game
+std::mutex playlistMutex;
+std::vector<std::string> playlistBag;
+std::string playlistLast;
+bool playlistWavUsable(const std::string& path) {return wavUsableForGame(path);}
+std::string nextPlaylistFile() {
+    if(!musicPlaylist)return "";
+    std::lock_guard<std::mutex> lock(playlistMutex);
+    if(playlistBag.empty()) {
+        std::wstring root=configPath.substr(0,configPath.find_last_of(L'\\')+1);
+        char rootA[MAX_PATH*2]{};WideCharToMultiByte(CP_ACP,0,root.c_str(),-1,rootA,sizeof rootA-1,nullptr,nullptr);
+        std::string folder=musicPlaylistFolder.empty()?std::string(rootA)+"AUDIO\\MUSIC\\Playlist":musicPlaylistFolder;
+        for(char& ch:folder)if(ch=='/')ch='\\';
+        if(!(folder.size()>1 && (folder[1]==':' || (folder[0]=='\\' && folder[1]=='\\'))))folder=std::string(rootA)+folder;      // relative to the game folder
+        while(!folder.empty() && (folder.back()=='\\' || folder.back()=='/'))folder.pop_back();
+        WIN32_FIND_DATAA found{};HANDLE find=FindFirstFileA((folder+"\\*.wav").c_str(),&found);
+        std::vector<std::string> files;
+        if(find!=INVALID_HANDLE_VALUE) {
+            do if(!(found.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)) {
+                std::string path=folder+"\\"+found.cFileName;
+                if(playlistWavUsable(path))files.push_back(path);
+                else {static int skipped=0;if(skipped++<6){char m[400];std::snprintf(m,sizeof m,"music: playlist skips %s (not a PCM 8/16-bit mono/stereo WAV)",path.c_str());status(m);}}
+            } while(FindNextFileA(find,&found));
+            FindClose(find);
+        }
+        if(files.empty())return "";
+        std::sort(files.begin(),files.end(),[](const std::string& a,const std::string& b){return _stricmp(a.c_str(),b.c_str())<0;});
+        if(musicPlaylistShuffle) {
+            static std::mt19937 random(GetTickCount());
+            std::shuffle(files.begin(),files.end(),random);
+            if(files.size()>1 && files.front()==playlistLast)std::swap(files.front(),files.back());   // not the same piece twice in a row
+        }
+        playlistBag.assign(files.rbegin(),files.rend());     // taken from the back
+        char m[160];std::snprintf(m,sizeof m,"music: playlist of %zu WAV files (%s order)",files.size(),musicPlaylistShuffle?"random":"name");status(m);
+    }
+    std::string next=playlistBag.back();playlistBag.pop_back();playlistLast=next;
+    return next;
+}
 HMMIO WINAPI mmioOpenHook(LPSTR name,LPMMIOINFO info,DWORD flags) {
     if(soundWatch && name && !info) {
         const char* slash=std::strrchr(name,'\\');if(const char* other=std::strrchr(name,'/'))if(!slash || other>slash)slash=other;
         std::string base=slash?slash+1:name;
         if(base.size()>4 && _stricmp(base.c_str()+base.size()-4,".wav")==0){EnterCriticalSection(&soundLock);lastOpenedWav=base;LeaveCriticalSection(&soundLock);}
+    }
+    if(musicWavFiles && name && !info && !(flags&(MMIO_WRITE|MMIO_READWRITE|MMIO_CREATE))) {
+        const size_t length=std::strlen(name);
+        if(length>4 && _stricmp(name+length-4,".rra")==0) {
+            // 1. [MusicFiles] in RoadRashHD.ini: TRACK=any file name (relative to the folder of the track, or a full path)
+            std::string chosen;
+            {
+                const char* slash=std::strrchr(name,'\\');if(const char* other=std::strrchr(name,'/'))if(!slash || other>slash)slash=other;
+                const std::string folder=slash?std::string(name,slash+1-name):std::string();
+                const std::string track=std::string(slash?slash+1:name).substr(0,std::string(slash?slash+1:name).size()-4);
+                wchar_t key[128]{};MultiByteToWideChar(CP_ACP,0,track.c_str(),-1,key,127);
+                wchar_t value[MAX_PATH]{};
+                GetPrivateProfileStringW(L"MusicFiles",key,L"",value,MAX_PATH,configPath.c_str());
+                if(value[0]) {
+                    char ansi[MAX_PATH*2]{};WideCharToMultiByte(CP_ACP,0,value,-1,ansi,sizeof ansi-1,nullptr,nullptr);
+                    std::string file=ansi;
+                    const bool absolute=file.size()>1 && (file[1]==':' || (file[0]=='\\' && file[1]=='\\'));
+                    for(char& ch:file)if(ch=='/')ch='\\';
+                    // a plain name is in the folder of the track (AUDIO\MUSIC); a path with folders is relative to the game folder; a full path is used as it is
+                    if(!absolute) {
+                        const bool hasFolder=file.find('\\')!=std::string::npos;
+                        std::wstring root=configPath.substr(0,configPath.find_last_of(L'\\')+1);
+                        char rootA[MAX_PATH*2]{};WideCharToMultiByte(CP_ACP,0,root.c_str(),-1,rootA,sizeof rootA-1,nullptr,nullptr);
+                        file=(hasFolder?std::string(rootA):folder)+file;
+                    }
+                    if(GetFileAttributesA(file.c_str())!=INVALID_FILE_ATTRIBUTES) {
+                        if(playlistWavUsable(file))chosen=file;
+                        else {static int bad=0;if(bad++<6){char m[300];std::snprintf(m,sizeof m,"music: [MusicFiles] %s=%s: not a PCM 8/16-bit mono/stereo WAV, it is skipped",track.c_str(),ansi);status(m);}}
+                    } else {static int missing=0;if(missing++<6){char m[300];std::snprintf(m,sizeof m,"music: [MusicFiles] %s=%s: file not found (%s)",track.c_str(),ansi,file.c_str());status(m);}}
+                }
+            }
+            // 2. NAME.WAV next to NAME.RRA
+            if(chosen.empty()) {
+                std::string wav(name,length-4);wav+=".WAV";
+                if(GetFileAttributesA(wav.c_str())!=INVALID_FILE_ATTRIBUTES) {
+                    if(playlistWavUsable(wav))chosen=wav;
+                    else {static int bad=0;if(bad++<6){char m[300];std::snprintf(m,sizeof m,"music: %s is not a PCM 8/16-bit mono/stereo WAV, the original plays",wav.c_str());status(m);}}
+                }
+            }
+            // 3. the playlist folder
+            if(chosen.empty())chosen=nextPlaylistFile();
+            if(!chosen.empty()) {
+                std::vector<char> path(chosen.begin(),chosen.end());path.push_back(0);
+                HMMIO handle=originalMmioOpen(path.data(),info,flags);
+                if(handle) {
+                    static int logged=0;
+                    if(logged++<12){char m[400];std::snprintf(m,sizeof m,"music: %s plays from %s",name,chosen.c_str());status(m);}
+                    return handle;
+                }
+            }
+        }
     }
     if(quietEffects && name && !info && !(flags&(MMIO_WRITE|MMIO_READWRITE|MMIO_CREATE))) {
         std::string louder=quietCopyFor(name);
@@ -1951,7 +2186,7 @@ CreateBufferFn originalCreateBuffer=nullptr;DuplicateBufferFn originalDuplicateB
 // one original per vtable (the buffer classes of dsound have their own tables)
 std::unordered_map<void**,std::array<void*,3>> bufferOriginals;   // Play, SetVolume, Release
 void soundLog(const std::string& message) {
-    if(soundLogged>=12000)return;
+    if(soundLogged>=600)return;                               // the first 600 events are enough for a bug report and keep the log readable
     ++soundLogged;status(message.c_str());
 }
 bool pedestrianName(const std::string& name) {
@@ -2029,8 +2264,24 @@ void watchBuffer(void* buffer,const std::string& name) {
     }
     LeaveCriticalSection(&soundLock);
 }
+// Music from WAV files ([Audio] MusicWavFiles). The music (MUSIC\NAME.RRA) is a WAV file with the extension .RRA that the game streams through one
+// DirectSound buffer of 11 chunks, refilled every 50 ms (0x411d80 / 0x412860). The chunk size is (samples per second * 16) / 11 bytes, which is a
+// whole number of sample frames for the original 8-bit 22.05 kHz stereo (chunk 32072, frame 2) but not for 16-bit 44.1 kHz stereo (chunk 64145, frame 4):
+// the buffer then holds one byte too many, the stream slips by a byte at every wrap and turns into white noise a few seconds in. When the chunk
+// is not a multiple of the frame size it is rounded down (and the buffer made exactly 11 chunks) before the buffer is created.
+// A MUSIC\NAME.WAV next to NAME.RRA is played instead of it (any PCM WAV, for example CD quality).
 HRESULT STDMETHODCALLTYPE createBufferHook(void* self,const DSBUFFERDESC* desc,LPDIRECTSOUNDBUFFER* buffer,IUnknown* outer) {
-    HRESULT hr=originalCreateBuffer(self,desc,buffer,outer);
+    DSBUFFERDESC fixed{};const DSBUFFERDESC* use=desc;
+    if(musicWavFiles && desc && desc->dwSize==20 && !(desc->dwFlags&DSBCAPS_PRIMARYBUFFER) && desc->lpwfxFormat && desc->lpwfxFormat==at<WAVEFORMATEX*>(0x5a6910)) {
+        const unsigned frame=std::max<unsigned>(1,desc->lpwfxFormat->nBlockAlign);
+        uint32_t& chunk=at<uint32_t>(0x5a6948);uint32_t& total=at<uint32_t>(0x5a6944);
+        if(frame>1 && chunk>frame && chunk%frame!=0 && total==chunk*11) {
+            chunk-=chunk%frame;total=chunk*11;
+            std::memcpy(&fixed,desc,20);fixed.dwBufferBytes=total;use=&fixed;
+            char m[160];std::snprintf(m,sizeof m,"music: stream buffer rounded to whole sample frames (frame %u bytes, chunk %u bytes, buffer %u bytes)",frame,unsigned(chunk),unsigned(total));status(m);
+        }
+    }
+    HRESULT hr=originalCreateBuffer(self,use,buffer,outer);
     if(audioTrace && SUCCEEDED(hr) && buffer && *buffer && desc && (desc->dwFlags&DSBCAPS_PRIMARYBUFFER)) {
         watchBuffer(*buffer,"<primary>");status("audio trace: DirectSound primary buffer is watched");
     }
@@ -2056,15 +2307,16 @@ using MidiSetVolumeFn=MMRESULT(WINAPI*)(HMIDIOUT,DWORD);MidiSetVolumeFn original
 // [Audio] MidiVolumeGuard. The game sets the volume of its MIDI music with midiOutSetVolume (Master x Game music from the Sound Mix screen). On a
 // Windows where the MIDI device supports volume (the Microsoft GS Wavetable Synth, a virtual synth, the new Windows MIDI Services) that call is applied
 // to the WHOLE application in the Windows volume mixer, and Windows remembers it: a music slider at 0 left the game without any sound, also after a
-// restart, until the level was raised in the Windows mixer. A silent request is therefore not passed on; the music is muted by the game itself (its mute
-// flag) and every other value still reaches the device.
-bool midiVolumeGuard=true;
+// restart, until the level was raised in the Windows mixer. A silent request is therefore not passed on; the MIDI music is muted in the stream
+// instead (midiStreamOutHook) and every other value still reaches the device.
+bool midiVolumeGuard=true,midiStreamHooked=false;
+double midiCeiling=0.7;   // [Audio] MidiMaxPercent (default 70): the velocity factor at a music level of 100 %, so that 100 % is not too loud
 bool midiVolumeIsSilent(DWORD volume) {   // both channels below about 5 % (0x0ccc of 0xffff): not audible anyway
     return (volume&0xffff)<0x0ccc && (volume>>16)<0x0ccc;
 }
 MMRESULT WINAPI midiSetVolumeHook(HMIDIOUT device,DWORD volume) {
     MMRESULT result;
-    bool held=midiVolumeGuard && midiVolumeIsSilent(volume);
+    bool held=midiVolumeGuard && (midiStreamHooked || midiVolumeIsSilent(volume));   // the level is applied in the stream when that hook is on
     if(held) {
         result=MMSYSERR_NOERROR;
         static bool logged=false;
@@ -2075,6 +2327,65 @@ MMRESULT WINAPI midiSetVolumeHook(HMIDIOUT device,DWORD volume) {
                                   unsigned(reinterpret_cast<uintptr_t>(_ReturnAddress())-base+0x400000));status(m);
     }
     return result;
+}
+// With the guard the device volume of the game's MIDI is no longer touched, so the music level is applied in the stream instead. The game
+// plays MIDI with midiStreamOut (buffers of MIDIEVENTs). The level of the Sound Mix screen (master x game music, the value the game turns into
+// the device volume at 0x4452a0) scales the velocity of every note-on in a buffer before it is queued (General MIDI plays the amplitude as
+// about the square of the velocity) by the slider percentage to the power 0.65 (5 % -> 10 % of the velocity), with a ceiling of [Audio] MidiMaxPercent at 100 %; only a level of 0 clears it. Notes that
+// already sound end with their note-off, which is left alone, and a new level applies from the next buffer. Many Windows MIDI devices ignore
+// midiOutSetVolume, which is why the slider did nothing for the MIDI music.
+using MidiStreamOutFn=MMRESULT(WINAPI*)(HMIDISTRM,LPMIDIHDR,UINT);MidiStreamOutFn originalMidiStreamOut=nullptr;
+double mixerMusicGain() {
+    const int master=std::clamp(at<int>(0x58e010),0,100),game=std::clamp(at<int>(0x58e070),0,100);
+    return double(master*game)/10000.0;
+}
+void scaleMidiBuffer(LPMIDIHDR header,double gain) {
+    if(!header || !header->lpData)return;
+    const bool silent=gain<0.005;                               // a slider at 0 (a level below half a percent)
+    const double velocityScale=std::pow(gain,0.65)*midiCeiling; // 5 % of the slider plays 10 % of the velocity (at the default ceiling of 70 %); 100 % plays [Audio] MidiMaxPercent
+    uint8_t* data=reinterpret_cast<uint8_t*>(header->lpData);
+    const size_t size=header->dwBytesRecorded;
+    for(size_t i=0;i+12<=size;) {
+        DWORD event;std::memcpy(&event,data+i+8,4);
+        const unsigned type=(event>>24)&0xff;
+        if(type&0x80) {                                         // long message (SysEx, comment, version): 12 bytes + padded data
+            i+=12+((size_t(event&0xffffff)+3)&~size_t(3));continue;
+        }
+        if((type&0x3f)==0 && (event&0xf0)==0x90) {              // short message: note-on
+            const unsigned velocity=(event>>16)&0x7f;
+            if(velocity) {
+                const unsigned scaled=silent?0:std::max(1u,unsigned(std::lround(velocity*velocityScale)));
+                event=(event&0xff00ffffu)|(scaled<<16);std::memcpy(data+i+8,&event,4);
+            }
+        }
+        i+=12;
+    }
+}
+// The game may submit the same MIDIHDR again (a loop, a re-sent buffer). Scaling is always done from the bytes the game wrote: the original
+// and the scaled copy of each header are remembered, and a buffer that still holds our scaled bytes is restored before it is scaled again.
+struct MidiScaled {std::vector<uint8_t> original,scaled;};
+std::map<LPMIDIHDR,MidiScaled> midiScaled;std::deque<LPMIDIHDR> midiScaledOrder;std::mutex midiScaledMutex;
+void scaleMidiBufferOnce(LPMIDIHDR header,double gain) {
+    if(!header || !header->lpData)return;
+    std::lock_guard<std::mutex> lock(midiScaledMutex);
+    uint8_t* data=reinterpret_cast<uint8_t*>(header->lpData);const size_t size=header->dwBytesRecorded;
+    if(!midiScaled.count(header))midiScaledOrder.push_back(header);
+    MidiScaled& entry=midiScaled[header];
+    if(entry.scaled.size()==size && size && std::memcmp(entry.scaled.data(),data,size)==0)std::memcpy(data,entry.original.data(),size);   // our own output: back to the game's bytes
+    else entry.original.assign(data,data+size);
+    scaleMidiBuffer(header,gain);
+    entry.scaled.assign(data,data+size);
+    while(midiScaledOrder.size()>1024){midiScaled.erase(midiScaledOrder.front());midiScaledOrder.pop_front();}   // the oldest headers go first
+}
+MMRESULT WINAPI midiStreamOutHook(HMIDISTRM stream,LPMIDIHDR header,UINT size) {
+    if(midiVolumeGuard) {
+        const double gain=mixerMusicGain();
+        scaleMidiBufferOnce(header,gain);
+        static int lastPercent=-1;
+        const int percent=int(gain*100+0.5);
+        if(percent!=lastPercent){lastPercent=percent;char m[120];std::snprintf(m,sizeof m,"audio: MIDI music level %d %% is applied to the notes in the stream",percent);status(m);}
+    }
+    return originalMidiStreamOut(stream,header,size);
 }
 using MciSendCommandFn=MCIERROR(WINAPI*)(MCIDEVICEID,UINT,DWORD_PTR,DWORD_PTR);MciSendCommandFn originalMciSendCommand=nullptr;
 MCIERROR WINAPI mciSendCommandHook(MCIDEVICEID device,UINT message,DWORD_PTR flags,DWORD_PTR parameters) {
@@ -2105,11 +2416,12 @@ HRESULT WINAPI directSoundCreateHook(LPCGUID device,LPDIRECTSOUND* sound,IUnknow
 // that the game then drops (the effect is still playing) never reaches DirectSound, so only this log shows it.
 uintptr_t playThunk=0;
 bool effectBuffer(void* effect,void** buffer) {   // no objects here, so SEH is allowed
-    __try {*buffer=*reinterpret_cast<void**>(static_cast<uint8_t*>(effect)+0x24);return true;}
-    __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+    ++probeDepth;
+    __try {*buffer=*reinterpret_cast<void**>(static_cast<uint8_t*>(effect)+0x24);--probeDepth;return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER) {--probeDepth;return false;}
 }
 extern "C" void __cdecl logPlayRequest(uintptr_t returnAddress,void* effect) {
-    if(soundLogged>=12000)return;
+    if(soundLogged>=600)return;
     std::string name="?";
     void* buffer=nullptr;
     if(effectBuffer(effect,&buffer)) {
@@ -2141,11 +2453,12 @@ __declspec(naked) void playRequestStub() {
 // the place in the game that queued it. For type 22 the effect is number (parameter - 69), see the names in the log.
 uintptr_t eventThunk=0;
 bool readInt(const void* address,int* value) {   // no objects here, so SEH is allowed
-    __try {*value=*static_cast<const int*>(address);return true;}
-    __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+    ++probeDepth;
+    __try {*value=*static_cast<const int*>(address);--probeDepth;return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER) {--probeDepth;return false;}
 }
 extern "C" void __cdecl logSoundEvent(uintptr_t returnAddress,int type,const void* parameters) {
-    if(soundLogged>=12000)return;
+    if(soundLogged>=600)return;
     int first=0;bool have=parameters && readInt(parameters,&first);
     char m[180];
     if(have)std::snprintf(m,sizeof m,"sound: event type %d parameter %d from 0x%x at %.2f s",type,first,unsigned(returnAddress-5-base+0x400000),double(GetTickCount()-soundStart)/1000.0);
@@ -2173,7 +2486,7 @@ __declspec(naked) void soundEventStub() {
 // voice that comes out of it follows as the "event type 22" line.
 uintptr_t pedestrianThunk=0;
 extern "C" void __cdecl logPedestrianLookup(unsigned handle,unsigned group,unsigned pedestrian,unsigned slot) {
-    if(soundLogged>=12000)return;
+    if(soundLogged>=600)return;
     char m[200];std::snprintf(m,sizeof m,"sound: pedestrian 0x%x handle 0x%x (bank %u record %u) group %u slot %u at %.2f s",
                               pedestrian,handle,(handle>>6)&3,handle&0x3f,group,slot,double(GetTickCount()-soundStart)/1000.0);
     soundLog(m);
@@ -2247,8 +2560,9 @@ void loadVoiceRules() {
 // byte-reversed as 'DPRR') with the magic 0xBC614E at +8 and its name ("OLDWMN05") at +0x18. The object's dwords that look like
 // pointers are followed (and the pointers found in what they point at), and the chunk is searched for in the memory around each.
 bool readMemory(const void* from,void* to,size_t count) {   // no objects here, so SEH is allowed
-    __try {memcpy(to,from,count);return true;}
-    __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+    ++probeDepth;
+    __try {memcpy(to,from,count);--probeDepth;return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER) {--probeDepth;return false;}
 }
 bool spriteNameIn(const uint8_t* block,size_t size,char* name) {
     for(size_t i=0;i+0x20<=size;++i) {
@@ -2383,7 +2697,7 @@ __declspec(naked) void pedestrianLookupStubB() {
 // pedestrian is only "alive" (0x1e0 = 1, 0x455e20) when the init at 0x455c60 finds both. Every one is logged with the result and the
 // sprite set, to see which objects (e.g. the flag girls) take part.
 extern "C" void __cdecl logLookupSite(unsigned returnAddress,unsigned handle,unsigned slot,void* result,void* pedestrian) {
-    if(soundLogged>=12000)return;
+    if(soundLogged>=600)return;
     static std::map<uint64_t,int> seen;   // the animation lookups repeat every frame: one line per object and place is enough
     uint64_t key=(uint64_t(reinterpret_cast<uintptr_t>(pedestrian))<<32)|(returnAddress&0xffffffu);
     if(seen.size()>4000)seen.clear();
@@ -2418,7 +2732,7 @@ void* reactionOriginal=nullptr;
 struct ReactionState{int alive,state,a,b,c,d,riderState,riderSpeed;};
 std::map<uintptr_t,ReactionState> reactionStates;
 extern "C" void __cdecl logReaction(void* object) {
-    if(soundLogged>=12000)return;
+    if(soundLogged>=600)return;
     static uint8_t copy[0x230];
     if(!readMemory(object,copy,sizeof copy))return;
     ReactionState now{copy[0x1e0],*reinterpret_cast<int*>(copy+0x1e8),*reinterpret_cast<int*>(copy+0x1ec),*reinterpret_cast<int*>(copy+0x210),
@@ -2884,8 +3198,94 @@ uint8_t __cdecl hidScanHook() {
     return 0;
 }
 
+// Smooth road ([Game] SmoothRoad=1). The game projects the track section by section (0x459170, driven by 0x459cb0). The
+// start values for the first, partial section are computed with integer truncation: the elevation offset
+// -((slope*frac)>>8) and the lateral step (curve*(256-frac))>>8, frac = camera position & 0xff. A lost fraction of a unit moves
+// every section by that fraction times its screen scale (up to 5 px per unit near the camera) in Y, and k times as much in X
+// for section k, so the road jumps by 1-2 px whenever the integer part changes. After each section the lost fractions are added
+// back to the section's Y and X fields (plain track, type 0). Everything is checked against the values the game computed;
+// anything unexpected leaves the section untouched. In addition the half-pixel snapping of the track ("and reg,0xffffc000", the
+// old scanline renderer's alignment, 3 px at 4K) is removed, see initialize().
+bool smoothRoad=true;
+struct RoadIter {int* key=nullptr;int depth0=0,rem1=0,eps2=0;bool valid=false;};
+RoadIter roadIters[4];int roadIterNext=0;
+using SectionFn=void (__fastcall*)(uint8_t*,uint8_t*,int*);
+void __fastcall sectionHook(uint8_t* data,uint8_t* work,int* p) {
+    auto original=fn<SectionFn>(0x459170);
+    if(!smoothRoad){original(data,work,p);return;}
+    RoadIter* it=nullptr;
+    if(p[4]<=0x100) {                                        // first section of this iterator
+        it=&roadIters[roadIterNext++&3];it->key=p;it->valid=false;
+        const int frac=0x100-p[4];
+        const int slope=p[0];
+        const int curve=*reinterpret_cast<int*>(data+0xb8);
+        const int64_t numerator=int64_t(curve)*(256-frac);
+        const int trunc=int(numerator/256);                  // the game's (n + (n>>31 & 0xff)) >> 8 is division towards zero
+        if(p[1]==-((slope*frac)>>8) && p[2]==trunc && p[3]==0 && frac>=0 && frac<=0xff) {
+            it->depth0=p[4];it->rem1=(slope*frac)&0xff;it->eps2=int(numerator-int64_t(trunc)*256);it->valid=true;
+        }
+    } else for(auto& e:roadIters)if(e.key==p){it=&e;break;}
+    uint8_t* prev8=reinterpret_cast<uint8_t*>(p[8]);uint8_t* prev9=reinterpret_cast<uint8_t*>(p[9]);
+    const int depth=p[4];
+    original(data,work,p);
+    if(!it || !it->valid || data[0x3c]!=0)return;            // curved/special track types are left alone
+    const int k=(depth-it->depth0)>>8;
+    const int scale=*reinterpret_cast<int*>(work+0x20);
+    const int dy=int((int64_t(it->rem1)*scale)>>8);
+    const int dx=int((int64_t(k)*it->eps2*scale)>>8);
+    if(!dy && !dx)return;
+    for(int off:{0x38,0x4c,0x54,0x5c,0x64,0x6c})*reinterpret_cast<int*>(work+off)+=dy;
+    for(int off:{0x40,0x44,0x48,0x50,0x58,0x60,0x68})*reinterpret_cast<int*>(work+off)+=dx;
+    p[7]+=dy;
+    if(prev8){*reinterpret_cast<int*>(prev8+0x28)+=dy;*reinterpret_cast<int*>(prev8+0x30)+=dx;}
+    if(prev9){if(prev9!=prev8)*reinterpret_cast<int*>(prev9+0x28)+=dy;*reinterpret_cast<int*>(prev9+0x34)+=dx;}
+}
+
+// Odometer (the HUD distance, 0x45d6d0). The game computes the distance driven in tenths of a mile (tenths of a km with metric
+// units) from the player's track position ((pos>>8)-50)/33 or ((pos>>5)-400)/165 and keeps it in ONE BYTE (0x5cd3fd), so the
+// display wraps to 0 after 25.5 (kilometres: every course longer than 25.5 km, which is most of them at higher levels) and a
+// position before the start line shows 25.x. The read at 0x45d85e is redirected here: the same value, computed in full, never
+// below 0. With [Game] DistanceToFinish=1 the display counts down to the finish instead: the course length from the game's own
+// table (0x594cb8, the numbers of the track menu: track row by 5 + level) minus the distance driven.
+bool distanceToFinish=false;
+int odometerDriven() {
+    const uintptr_t player=at<uintptr_t>(0x5a69ec);
+    if(!player)return 0;
+    const int pos=*reinterpret_cast<const int*>(player+0x44);
+    const bool metric=fn<char(__cdecl*)()>(0x402351)()!=0;
+    int tenths;
+    if(metric) {int64_t v=(int64_t(int(pos>>5)-0x190)*0x634c0635LL)>>32;int w=int(v>>6);tenths=w+int(uint32_t(w)>>31);}
+    else {int64_t v=(int64_t(int(pos>>8)-0x32)*0x3e0f83e1LL)>>32;int w=int(v>>3);tenths=w+int(uint32_t(w)>>31);}
+    return tenths<0?0:tenths;
+}
+int __cdecl odometerValue() {
+    int driven=odometerDriven();
+    if(distanceToFinish) {
+        const int track=at<int8_t>(0x5ac1cd),level=at<uint8_t>(0x6041a2);
+        if(track>=0 && track<5 && level<5) {
+            int length=at<int32_t>(0x594cb8+4*(track*5+level));
+            if(fn<char(__cdecl*)()>(0x402351)()!=0)length=int(double(length)*at<double>(0x505ad0));
+            static int lastLength=-1,lastTrack=-1,lastLevel=-1;
+            if(length!=lastLength || track!=lastTrack || level!=lastLevel) {
+                lastLength=length;lastTrack=track;lastLevel=level;
+                char m[160];std::snprintf(m,sizeof m,"odometer: course %d level %d finish at %d.%d, driven %d.%d",track,level,length/10,length%10,driven/10,driven%10);status(m);
+            }
+            driven=length>driven?length-driven:0;
+        }
+    }
+    return driven>9999?9999:driven;
+}
+
+// Keep completed tracks ([Game] KeepCompletedTracks, on by default). The save keeps one bit per completed track (0x6041a3). When the
+// fifth track of the last level is won (mask 0x1f) the game clears the mask and shows the ending (0x437887 and the same code at
+// 0x43869b: "mov [0x6041a3],0 ... mov eax,0x24"), so a finished game looks as if no track had been completed. At the last level the
+// call below restores the five bits and returns the same value (0x24) the game returned.
+bool keepCompletedTracks=true;
+int __cdecl finalLevelDone() {at<uint8_t>(0x6041a3)=0x1f;return 0x24;}
+
 bool initialize(HMODULE module) {
-    base=reinterpret_cast<uintptr_t>(module);
+    base=reinterpret_cast<uintptr_t>(module);journaling=true;
+    ownModule=rendererModule?rendererModule:module;AddVectoredExceptionHandler(1,crashLogger);
     struct Hook {uintptr_t thunk,original;void* hook;};
     Hook hooks[]={
         {0x401a2d,0x41be80,reinterpret_cast<void*>(&animationFrameHook)},
@@ -2899,6 +3299,60 @@ bool initialize(HMODULE module) {
         {0x401118,0x46e470,reinterpret_cast<void*>(&present16Hook)}
     };
     for(auto h:hooks)if(!isBranch(h.thunk,0xe9,h.original)){status("unsupported executable; no hooks installed");return false;}
+    if(at<uint16_t>(0x45b3c0)!=0xc033 || at<uint16_t>(0x45b3c2)!=0x05c7 ||
+       at<uintptr_t>(0x45b3c4)!=base+0x1cd224 || at<uintptr_t>(0x45b3c8)!=base+0x5bd20) {
+        status("unsupported resolution menu; no hooks installed");return false;
+    }
+    if(!at<Stretch>(0x61c15c))return false;                  // everything above is checked before the first byte of the game is changed
+    {
+        // movzx edx,byte ptr [0x5cd3fd] (7 bytes) -> call odometerValue; mov edx,eax
+        const size_t journalMark=patchJournal.size();
+        const uint8_t expect[3]={0x0f,0xb6,0x15};
+        bool match=std::memcmp(&at<uint8_t>(0x45d85e),expect,3)==0 && at<uintptr_t>(0x45d861)==base+0x1cd3fd;
+        if(match) {
+            const uint8_t movEdxEax[2]={0x89,0xc2};
+            const bool good=branch(0x45d85e,reinterpret_cast<void*>(&odometerValue),0xe8) && writeMemory(base+0x45d863-0x400000,movEdxEax,2);
+            if(!good)rollbackPatches(journalMark,"odometer");
+            status(good?(distanceToFinish?"odometer: full range, distance to the finish":"odometer: full range (no wrap at 25.5)"):"odometer patch failed");
+        } else status("odometer fix ignored: unexpected HUD code");
+    }
+    if(keepCompletedTracks) {
+        const uintptr_t sites[]={0x4378a7,0x4386ed};
+        bool match=true;
+        for(auto site:sites)match=match && at<uint8_t>(site)==0xb8 && at<uint32_t>(site+1)==0x24;
+        for(uintptr_t clear:{0x43789c,0x4386e2})match=match && at<uint8_t>(clear)==0xc6 && at<uint8_t>(clear+1)==0x05 && at<uintptr_t>(clear+2)==base+0x2041a3 && at<uint8_t>(clear+6)==0;
+        const size_t journalMark=patchJournal.size();
+        if(match){bool good=true;for(auto site:sites)good=branch(site,reinterpret_cast<void*>(&finalLevelDone),0xe8)&&good;if(!good)rollbackPatches(journalMark,"keep completed tracks");status(good?"completed tracks are kept after the last level":"keep completed tracks: patch failed");}
+        else status("keep completed tracks ignored: unexpected code");
+    }
+    if(smoothRoad) {
+        const uintptr_t sites[]={0x459dcb,0x459f56,0x459f65,0x45a138,0x45a147,0x45a360};
+        bool match=true;
+        for(auto s:sites)match=match && at<uint8_t>(s)==0xe8 && uintptr_t(intptr_t(s+5)+at<int32_t>(s+1))==0x459170;
+        const size_t roadMark=patchJournal.size();
+        if(match){bool good=true;for(auto s:sites)good=branch(s,reinterpret_cast<void*>(&sectionHook),0xe8)&&good;if(!good){rollbackPatches(roadMark,"smooth road");smoothRoad=false;}else status("smooth road: track projection hooked");}
+        else {smoothRoad=false;status("smooth road ignored: unexpected track code");}
+        // The road surface, the section edges and the roadside objects are cut to a half pixel grid of the 640x480 picture
+        // ("and reg, 0xffffc000": the old scanline renderer's alignment). At 4K that is a 3 px grid: the polygons step and pulse as
+        // the camera moves. Turning each mask into "and reg, -1" keeps the full 1/32768 pixel position (the Direct3D and
+        // CPU renderers here draw sub-pixel positions). Every site is checked first; nothing is patched on a mismatch.
+        struct Snap {uintptr_t va;uint8_t length;};
+        const Snap snaps[]={{0x41f1ab,6},{0x41f1b1,6},{0x41f1bd,6},{0x41f1c3,5},{0x41f8f9,6},{0x41f908,5},{0x41f921,6},{0x41f933,5},{0x41f948,5},
+            {0x41f958,5},{0x41f96d,5},{0x41f97f,6},{0x41f98e,5},{0x41f9a4,5},{0x433f2b,5},{0x433f75,5},{0x43400a,5},{0x44e8ad,6},{0x44ea37,6},
+            {0x44f3c0,6},{0x44f3dd,6},{0x46785c,6}};
+        bool snapsMatch=true;
+        for(auto s:snaps) {
+            const uintptr_t imm=s.va+s.length-4;
+            snapsMatch=snapsMatch && at<uint32_t>(imm)==0xffffc000u && (s.length==5?at<uint8_t>(s.va)==0x25:(at<uint8_t>(s.va)==0x81));
+        }
+        if(snapsMatch) {
+            const uint32_t none=0xffffffffu;bool good=true;
+            const size_t snapMark=patchJournal.size();
+            for(auto s:snaps)good=writeMemory(base+s.va+s.length-4-0x400000,&none,4)&&good;
+            if(!good)rollbackPatches(snapMark,"smooth road snapping");
+            status(good?"smooth road: half-pixel snapping of the track removed":"smooth road: snapping patch failed");
+        } else status("smooth road: snapping patch ignored, unexpected code");
+    }
     if(at<uint16_t>(0x45b3c0)!=0xc033 || at<uint16_t>(0x45b3c2)!=0x05c7 ||
        at<uintptr_t>(0x45b3c4)!=base+0x1cd224 || at<uintptr_t>(0x45b3c8)!=base+0x5bd20) {
         status("unsupported resolution menu; no hooks installed");return false;
@@ -3028,6 +3482,11 @@ bool initialize(HMODULE module) {
                 originalMidiSetVolume=reinterpret_cast<MidiSetVolumeFn>(o);
                 if(midiVolumeGuard)status("audio: the MIDI volume guard is on (a silent MIDI volume is not applied to the whole game)");
             }
+            if(midiVolumeGuard) {
+                void* s=nullptr;
+                if(hookImport(0x61c890,L"winmm.dll","midiStreamOut",reinterpret_cast<void*>(&midiStreamOutHook),&s)){originalMidiStreamOut=reinterpret_cast<MidiStreamOutFn>(s);midiStreamHooked=true;}
+                else status("audio: the MIDI music cannot be muted in the stream (unexpected import table)");
+            }
         }
         if(audioTrace) {
             void* o=nullptr;
@@ -3127,6 +3586,8 @@ bool initialize(HMODULE module) {
     Stretch hook=&stretchHook;ok=writeMemory(base+0x21c15c,&hook,sizeof hook)&&ok;
     Fill fill=&fillHook;ok=writeMemory(base+0x21c728,&fill,sizeof fill)&&ok;
     ok=branch(0x45b3c0,reinterpret_cast<void*>(&resolutionMenuHook),0xe9)&&ok;
+    journaling=false;
+    if(!ok)rollbackPatches(0,"hook installation");
     status(ok?(std::string(RRHD_NAME " v" RRHD_VERSION RRHD_BUILD_SUFFIX " (renderer v5): animation null-metadata fix, subpixel geometry, textured menu extension and native raster")).c_str():"hook installation failed");return ok;
 }
 }
@@ -3249,12 +3710,27 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     {HANDLE h=CreateThread(nullptr,0,healSessionVolumeThread,nullptr,0,nullptr);if(h)CloseHandle(h);}
     if(videoVolume<0)videoVolume=0;if(videoVolume>100)videoVolume=100;
     fullRateObjects=GetPrivateProfileIntW(L"Game",L"FullRateObjects",1,configPath.c_str())!=0;
-    quietEffects=GetPrivateProfileIntW(L"Audio",L"LouderPedestrians",1,configPath.c_str())!=0;
-    quietGainDb=std::max(0,std::min(12,int(GetPrivateProfileIntW(L"Audio",L"PedestrianGainDb",3,configPath.c_str()))));
-    pedestrianRelief=std::max(0,std::min(100,int(GetPrivateProfileIntW(L"Audio",L"PedestrianVolumeRelief",60,configPath.c_str()))));
-    pedestrianVoiceRelief=std::max(0,std::min(100,int(GetPrivateProfileIntW(L"Audio",L"PedestrianVoiceRelief",100,configPath.c_str()))));
+    smoothRoad=GetPrivateProfileIntW(L"Game",L"SmoothRoad",1,configPath.c_str())!=0;
+    keepCompletedTracks=GetPrivateProfileIntW(L"Game",L"KeepCompletedTracks",1,configPath.c_str())!=0;
+    distanceToFinish=GetPrivateProfileIntW(L"Game",L"DistanceToFinish",0,configPath.c_str())!=0;
+    // Pedestrian loudness ([Audio] PedestrianLoudness, percent, launcher slider): how much of the boost below is applied. 0 = the game's own
+    // levels, 100 = the full boost the earlier versions had, 67 (default) = two thirds of it. LouderPedestrians=0 still switches everything off.
+    {
+        double loudness=std::max(0,std::min(100,int(GetPrivateProfileIntW(L"Audio",L"PedestrianLoudness",67,configPath.c_str()))))/100.0;
+        if(GetPrivateProfileIntW(L"Audio",L"LouderPedestrians",1,configPath.c_str())==0)loudness=0;
+        quietEffects=loudness>0;
+        quietGainDb=std::max(0,std::min(12,int(GetPrivateProfileIntW(L"Audio",L"PedestrianGainDb",3,configPath.c_str()))))*loudness;
+        pedestrianRelief=int(std::lround(std::max(0,std::min(100,int(GetPrivateProfileIntW(L"Audio",L"PedestrianVolumeRelief",60,configPath.c_str()))))*loudness));
+        pedestrianVoiceRelief=int(std::lround(std::max(0,std::min(100,int(GetPrivateProfileIntW(L"Audio",L"PedestrianVoiceRelief",100,configPath.c_str()))))*loudness));
+    }
     femaleVoiceFallback=GetPrivateProfileIntW(L"Audio",L"FemaleVoiceFallback",1,configPath.c_str())!=0;
+    musicWavFiles=GetPrivateProfileIntW(L"Audio",L"MusicWavFiles",0,configPath.c_str())!=0;
+    musicPlaylist=GetPrivateProfileIntW(L"Audio",L"MusicPlaylist",0,configPath.c_str())!=0;
+    musicPlaylistShuffle=GetPrivateProfileIntW(L"Audio",L"MusicPlaylistShuffle",1,configPath.c_str())!=0;
+    {wchar_t folder[MAX_PATH]{};GetPrivateProfileStringW(L"Audio",L"MusicPlaylistFolder",L"",folder,MAX_PATH,configPath.c_str());
+     char ansi[MAX_PATH*2]{};WideCharToMultiByte(CP_ACP,0,folder,-1,ansi,sizeof ansi-1,nullptr,nullptr);musicPlaylistFolder=ansi;}
     midiVolumeGuard=GetPrivateProfileIntW(L"Audio",L"MidiVolumeGuard",1,configPath.c_str())!=0;
+    midiCeiling=std::clamp(int(GetPrivateProfileIntW(L"Audio",L"MidiMaxPercent",70,configPath.c_str())),10,100)/100.0;
     pedestrianVoiceGapMs=std::max(0,std::min(2000,int(GetPrivateProfileIntW(L"Audio",L"PedestrianVoiceGapMs",120,configPath.c_str()))));
     voiceRulesOn=GetPrivateProfileIntW(L"Audio",L"PedestrianVoiceRules",1,configPath.c_str())!=0;
     if(voiceRulesOn)loadVoiceRules();

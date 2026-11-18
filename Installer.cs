@@ -12,7 +12,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("RoadRash30-MultiFix")]
-[assembly: AssemblyDescription("Native HD, aspect ratio support, texture filtering and fixes for the GOG, EA app and Steam English builds. Loads through ddraw.dll; RoadRash95.exe is never modified.")]
+[assembly: AssemblyDescription("Native HD, aspect ratio support, texture filtering and fixes for the GOG, EA app and Steam English builds. Loads through ddraw.dll; RoadRash95.exe is only changed by the optional 4 GB (Large Address Aware) switch, with a backup.")]
 [assembly: AssemblyVersion(ModInfo.Version + ".0")]
 [assembly: AssemblyFileVersion(ModInfo.Version + ".0")]
 
@@ -26,12 +26,21 @@ internal sealed class GameInstall
 // One switch stored in RoadRashHD.ini.
 internal sealed class PatchOption
 {
-    public string Section, Key, Label, Hint;
+    public string Section, Key, Label, Hint, Category;
     public bool Default;
     // Inverted: the check box means the opposite of the ini value (checked = ini value 0).
     public bool Inverted;
     public PatchOption(string section, string key, bool def, string label, string hint, bool inverted = false)
     { Section = section; Key = key; Default = def; Label = label; Hint = hint; Inverted = inverted; }
+}
+
+// One 0-100 setting of RoadRashHD.ini that is shown as a slider.
+internal sealed class PatchSlider
+{
+    public string Section, Key, Label, Hint, Category;
+    public int Min, Max, Default;
+    public PatchSlider(string section, string key, string label, string hint, int min, int max, int def, string category)
+    { Section = section; Key = key; Label = label; Hint = hint; Min = min; Max = max; Default = def; Category = category; }
 }
 
 internal static class Installer
@@ -50,7 +59,10 @@ internal static class Installer
     static readonly Dictionary<string, string> KnownExecutables = new Dictionary<string, string>
     {
         { "9e40e25737149ab095061b7154797a35495faea97644fafc5a1e616f1400c968",
-          "GOG (60184028392664413) and Steam (26105967)" }
+          "GOG (60184028392664413) and Steam (26105967)" },
+        // the same executable with the 4 GB (Large Address Aware) flag set by the launcher
+        { "598c367d6a97a45aacf821a0b499039e7a367d293387e7fd64455251062ecbf2",
+          "GOG (60184028392664413) and Steam (26105967), 4 GB patched" }
     };
 
     // Every switch of RoadRashHD.ini that makes sense to a player; each is shown on its own row, one line each.
@@ -73,13 +85,58 @@ internal static class Installer
         new PatchOption("Game", "SpriteFixes", true, "Sprite Fixes", "Fixes the damaged punch shadow and lowers the buildings that hover above the ground (red barn, brown shop, white house)"),
         new PatchOption("Window", "AutoHideCursor", true, "Auto-Hide Mouse Cursor", "Hidden at start and after 3 s without mouse movement; returns when you move the mouse"),
         new PatchOption("Window", "StartFullscreen", true, "Start in Fullscreen", "Opens the game in borderless fullscreen"),
-        new PatchOption("Input", "DualSense", false, "DualSense Support (Exp.)", "Bluetooth reports and d-pad steering/menus for a DualSense or DualShock over HID (untested without the pad)"),
+        new PatchOption("Input", "DualSense", false, "DualSense Support", "Bluetooth reports and d-pad steering and menus for a DualSense or DualShock over HID"),
         new PatchOption("Window", "DualMonitorUX", false, "Dual Monitor UX Improvements", "The mouse is not confined to the game window and the game does not minimize when you click another monitor"),
         new PatchOption("Audio", "PedestrianVoiceRules", true, "New Pedestrian Voices", "Bystanders, bikers, cops and others shout with a chosen pool of voices; flag girls and people at the start react too"),
-        new PatchOption("Audio", "LouderPedestrians", true, "Louder Pedestrians", "Pedestrian voices and footsteps are no longer far quieter than the rider"),
         new PatchOption("Game", "SkipIntro", false, "Skip Intro Videos", "Skips the studio logos and the intro movie (menu music still starts)"),
-        new PatchOption("Audio", "MidiVolumeGuard", true, "Muted Sound Fix", "Music slider at 0 mutes only the music; the game is no longer silenced in the Windows volume mixer"),
+        new PatchOption("Audio", "MusicWavFiles", false, "WAV Music Replacement", "Plays MUSIC\\NAME.WAV instead of NAME.RRA when it exists (any PCM WAV; 44.1 kHz and 48 kHz are fine)"),
+        new PatchOption("Audio", "MusicPlaylist", false, "Music Playlist", "Every WAV in AUDIO\\MUSIC\\Playlist is played as game music, in random order (needs WAV Music Replacement)"),
+        new PatchOption("Audio", "MidiVolumeGuard", true, "Muted Sound Fix", "MIDI music follows the Sound Mix slider (0 = silent); the game is not silenced in the Windows mixer"),
+        new PatchOption("Game", "DistanceToFinish", false, "Distance to Finish", "The HUD distance counts down to the finish line instead of up from the start"),
+        new PatchOption("Game", "SmoothRoad", true, "Smooth Road", "Removes the half-pixel snapping of the road and adds back the fractions the game drops, so the road and its edges do not jump or pulse"),
     };
+
+    // The launcher groups the options in tabs. Stability comes first.
+    public static readonly string[] Categories = { "Stability and QoL", "Graphics", "Display", "Audio", "Controls" };
+    static readonly Dictionary<string, string> CategoryOfKey = new Dictionary<string, string>
+    {
+        { "Input/AsyncControllerScan", "Stability and QoL" }, { "Game/FullRateObjects", "Stability and QoL" }, { "Performance/HighPerformance", "Stability and QoL" }, { "Performance/LowLatency", "Stability and QoL" },
+        { "Graphics/D3D11", "Graphics" }, { "Graphics/TextureFilter", "Graphics" }, { "Graphics/VSync", "Graphics" }, { "Game/FixBikeColors", "Graphics" },
+        { "Game/SpriteFixes", "Graphics" }, { "Game/SmoothRoad", "Graphics" },
+        { "Window/WideWindow", "Display" }, { "Window/StartFullscreen", "Display" }, { "Window/AltEnterFullscreen", "Display" }, { "Window/AutoHideCursor", "Display" }, { "Window/DualMonitorUX", "Display" },
+        { "Audio/PedestrianVoiceRules", "Audio" }, { "Audio/MidiVolumeGuard", "Audio" }, { "Audio/MusicWavFiles", "Audio" }, { "Audio/MusicPlaylist", "Audio" },
+        { "Input/SymmetricSteering", "Controls" }, { "Input/KeyboardAndPad", "Controls" }, { "Input/PadDialogs", "Controls" }, { "Input/DualSense", "Controls" },
+        { "Game/SkipIntro", "Stability and QoL" }, { "Game/DistanceToFinish", "Stability and QoL" }, { "Text/FixEncoding", "Stability and QoL" }
+    };
+    // Settings shown as sliders (in the tab of their category).
+    public static readonly PatchSlider[] Sliders =
+    {
+        new PatchSlider("Audio", "PedestrianLoudness", "Pedestrian Loudness", "Voices and footsteps of pedestrians: 0 = the game's own levels, 100 = the full boost of earlier versions", 0, 100, 67, "Audio"),
+        new PatchSlider("Game", "VideoVolume", "FMV Volume", "Volume of the intro and story videos (.avi and .mp4)", 0, 100, 100, "Audio")
+    };
+    static Installer()
+    {
+        foreach (var o in Options)
+        {
+            string category;
+            o.Category = CategoryOfKey.TryGetValue(o.Section + "/" + o.Key, out category) ? category : "Stability and QoL";
+        }
+    }
+    public static int ReadSlider(string folder, PatchSlider slider)
+    {
+        string ini = Path.Combine(folder ?? "", IniName);
+        if (!File.Exists(ini)) return slider.Default;
+        return Math.Max(slider.Min, Math.Min(slider.Max, (int)GetPrivateProfileInt(slider.Section, slider.Key, slider.Default, ini)));
+    }
+    public static bool SaveSlider(string folder, PatchSlider slider, int value)
+    {
+        try
+        {
+            string ini = Path.Combine(folder ?? "", IniName);
+            return File.Exists(ini) && WritePrivateProfileString(slider.Section, slider.Key, Math.Max(slider.Min, Math.Min(slider.Max, value)).ToString(), ini);
+        }
+        catch (Exception) { return false; }
+    }
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     static extern uint GetPrivateProfileInt(string section, string key, int def, string file);
@@ -206,9 +263,19 @@ internal static class Installer
         string hash = HashFile(exe), known;
         string fileVersion = "";
         try { fileVersion = FileVersionInfo.GetVersionInfo(exe).FileVersion; } catch (Exception) { }
+        // A known executable with the 4 GB flag set (by this launcher or by hand) is recognised by the hash of the file with that one flag cleared.
+        string unflagged = null;
+        try
+        {
+            byte[] bytes = File.ReadAllBytes(exe);
+            int at = CharacteristicsOffset(bytes);
+            if (at >= 0 && (BitConverter.ToUInt16(bytes, at) & LaaFlag) != 0) { bytes[at] &= 0xdf; unflagged = Hash(bytes); }
+        }
+        catch (Exception) { }
         if (hash != null && KnownExecutables.TryGetValue(hash, out known)) sb.Append("Executable: ").Append(known).Append(" (verified)\r\n");
+        else if (unflagged != null && KnownExecutables.TryGetValue(unflagged, out known)) sb.Append("Executable: ").Append(known).Append(", 4 GB patched (verified)\r\n");
         else sb.Append("Executable: not on the verified list (SHA-256 ").Append(hash == null ? "unreadable" : hash.Substring(0, 12) + "...")
-               .Append(fileVersion != "" ? ", file version " + fileVersion : "").Append("). The patch checks the game code at start-up and stays inactive if it does not match.\r\n");
+               .Append(fileVersion != "" ? ", file version " + fileVersion : "").Append(")\r\n");
         sb.Append("MultiFix: ").Append(Status(folder).Describe());
         return sb.ToString();
     }
@@ -378,6 +445,7 @@ internal static class Installer
 
     // Primary source (a redirect to the newest zip); the GitHub release of okplay is the fallback. Tests replace the list.
     internal static string[] NetplayUrls = { "https://oldkid.net/aoe2net/latest.php" };
+    const string OkPlayTagsApi = "https://api.github.com/repos/Patrick-Working/okplay/tags";
     const string OkPlayReleaseApi = "https://api.github.com/repos/Patrick-Working/okplay/releases/latest";
     // What is taken from the zip (by file name, wherever it sits in the archive). readme.txt is saved as oldkid_netplay_readme.txt.
     static readonly string[] NetplayFiles = { "netcheck.exe", "okplay.ini", "wsock32.dll", "readme.txt" };
@@ -436,6 +504,57 @@ internal static class Installer
             }
         }
         return written;
+    }
+
+    // The installed netplay version: the readme that came with it ("Oldkid.net Online Play  v0.8.7") is saved next to wsock32.dll.
+    public static string NetplayVersion(string folder)
+    {
+        try
+        {
+            string readme = Path.Combine(folder ?? "", "oldkid_netplay_readme.txt");
+            if (!File.Exists(readme)) return null;
+            using (var reader = new StreamReader(readme))
+                for (int i = 0; i < 6; ++i)
+                {
+                    string line = reader.ReadLine();
+                    if (line == null) break;
+                    var match = Regex.Match(line, @"Online Play\s+v?(\d+\.\d+(?:\.\d+)?)");
+                    if (match.Success) return match.Groups[1].Value;
+                }
+        }
+        catch (Exception) { }
+        return null;
+    }
+    // The newest netplay version: the highest version tag of github.com/Patrick-Working/okplay (the project has no downloadable
+    // releases there; the built zip is on oldkid.net, which the download uses), or the name of the zip oldkid.net serves as "latest".
+    // Blocking; call it from a worker thread. Null on any failure.
+    public static string FetchLatestNetplayVersion()
+    {
+        if (Environment.GetEnvironmentVariable("RRMF_NO_UPDATE_CHECK") == "1") return null;
+        string best = null;
+        try
+        {
+            System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)3072;
+            var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(OkPlayTagsApi);
+            request.UserAgent = "RoadRash30-MultiFix-launcher"; request.Accept = "application/vnd.github+json"; request.Timeout = 8000;
+            using (var response = request.GetResponse()) using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                foreach (Match tag in Regex.Matches(reader.ReadToEnd(), @"""name""\s*:\s*""[vV]?(\d+\.\d+(?:\.\d+)?)"""))
+                    if (best == null || IsNewer(tag.Groups[1].Value, best)) best = tag.Groups[1].Value;
+        }
+        catch (Exception) { }
+        if (best != null) return best;
+        try
+        {
+            var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(NetplayUrls[0]);
+            request.UserAgent = "RoadRash30-MultiFix-launcher"; request.Method = "HEAD"; request.AllowAutoRedirect = false; request.Timeout = 8000;
+            using (var response = request.GetResponse())
+            {
+                var match = Regex.Match(response.Headers["Location"] ?? "", @"v(\d+\.\d+(?:\.\d+)?)\.zip", RegexOptions.IgnoreCase);
+                if (match.Success) return match.Groups[1].Value;
+            }
+        }
+        catch (Exception) { }
+        return null;
     }
 
     // First zip asset of the latest okplay release on GitHub, or null (there may be none).
@@ -508,6 +627,123 @@ internal static class Installer
         string ini = Path.Combine(folder ?? "", IniName);
         if (!File.Exists(ini)) return option.Default;
         return (GetPrivateProfileInt(option.Section, option.Key, (option.Default != option.Inverted) ? 1 : 0, ini) != 0) != option.Inverted;
+    }
+
+    // ------------------------------------------------------------------ 4 GB (Large Address Aware)
+
+    // The optional switch that changes RoadRash95.exe: one flag (IMAGE_FILE_LARGE_ADDRESS_AWARE, 0x20, in the Characteristics field of the PE
+    // header). A 32-bit program gets 4 GB of address space instead of 2 GB on 64-bit Windows, which the game, the Direct3D driver and this patch share;
+    // running out of it shows up as missing textures and a crash after a few miles. The original is kept as RoadRash95.exe.multifix-backup.
+    public sealed class LaaStatus
+    {
+        public bool ExeFound, Valid, Patched, BackupExists, Is64BitWindows = Environment.Is64BitOperatingSystem;
+        public string Error;
+    }
+    const ushort LaaFlag = 0x0020;
+    static string ExeBackup(string folder) { return Path.Combine(folder, ExeName + BackupSuffix); }
+    // Offset of the Characteristics field, or -1 when the bytes are not a 32-bit Windows executable.
+    static int CharacteristicsOffset(byte[] exe)
+    {
+        if (exe == null || exe.Length < 0x100 || exe[0] != 0x4d || exe[1] != 0x5a) return -1;
+        int pe = BitConverter.ToInt32(exe, 0x3c);
+        if (pe < 0x40 || pe + 24 > exe.Length || exe[pe] != 'P' || exe[pe + 1] != 'E' || exe[pe + 2] != 0 || exe[pe + 3] != 0) return -1;
+        if (BitConverter.ToUInt16(exe, pe + 4) != 0x14c) return -1;      // IMAGE_FILE_MACHINE_I386
+        return pe + 22;
+    }
+    public static LaaStatus Laa(string folder)
+    {
+        var status = new LaaStatus();
+        try
+        {
+            string exe = Path.Combine(folder ?? "", ExeName);
+            status.ExeFound = File.Exists(exe);
+            if (!status.ExeFound) return status;
+            byte[] head;
+            using (var file = new FileStream(exe, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                head = new byte[Math.Min(4096, (int)file.Length)];
+                int got = 0; while (got < head.Length) { int n = file.Read(head, got, head.Length - got); if (n <= 0) break; got += n; }
+            }
+            int at = CharacteristicsOffset(head);
+            status.Valid = at >= 0;
+            if (status.Valid) status.Patched = (BitConverter.ToUInt16(head, at) & LaaFlag) != 0;
+            status.BackupExists = File.Exists(ExeBackup(folder));
+        }
+        catch (Exception error) { status.Error = error.Message; }
+        return status;
+    }
+    // Turns the flag on (with a backup of the original) or off (the original comes back from the backup). Returns null, or the reason it failed.
+    public static string SetLarge(string folder, bool enable)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(folder)) return "Choose the game folder first.";
+            string exe = Path.Combine(folder, ExeName);
+            if (!File.Exists(exe)) return "RoadRash95.exe was not found in this folder.";
+            foreach (var process in Process.GetProcessesByName("RoadRash95")) { process.Dispose(); return "Close Road Rash first."; }
+            if (enable && !Environment.Is64BitOperatingSystem) return "This Windows is 32-bit: the flag would have no effect.";
+            byte[] bytes = File.ReadAllBytes(exe);
+            int at = CharacteristicsOffset(bytes);
+            if (at < 0) return "RoadRash95.exe is not a 32-bit Windows program that this switch understands.";
+            ushort flags = BitConverter.ToUInt16(bytes, at);
+            bool patched = (flags & LaaFlag) != 0;
+            string backup = ExeBackup(folder);
+            if (enable)
+            {
+                if (patched) return null;
+                // the backup holds the unpatched file; it is replaced when the game's file is not the one it was made from (an update, a repair)
+                if (!File.Exists(backup) || Hash(File.ReadAllBytes(backup)) != Hash(bytes))
+                    File.WriteAllBytes(backup, bytes);
+                var changed = (byte[])bytes.Clone();
+                ushort value = (ushort)(flags | LaaFlag);
+                changed[at] = (byte)(value & 0xff); changed[at + 1] = (byte)(value >> 8);
+                ReplaceExe(exe, changed);
+                return Laa(folder).Patched ? null : "The change did not stick (another program may have restored the file).";
+            }
+            if (!patched) return null;
+            byte[] original = File.Exists(backup) ? File.ReadAllBytes(backup) : null;
+            int backupAt = CharacteristicsOffset(original);
+            bool sameFile = false;                                  // the backup is only used when it is this very file without the flag
+            if (original != null && backupAt >= 0 && original.Length == bytes.Length && (BitConverter.ToUInt16(original, backupAt) & LaaFlag) == 0)
+            {
+                var cleared = (byte[])bytes.Clone();
+                ushort clearedFlags = (ushort)(flags & ~LaaFlag);
+                cleared[at] = (byte)(clearedFlags & 0xff); cleared[at + 1] = (byte)(clearedFlags >> 8);
+                sameFile = Hash(cleared) == Hash(original);
+            }
+            if (sameFile)
+            {
+                ReplaceExe(exe, original);
+                try { File.Delete(backup); } catch (Exception) { }
+            }
+            else
+            {
+                var changed = (byte[])bytes.Clone();                    // no usable backup: clear the one flag
+                ushort value = (ushort)(flags & ~LaaFlag);
+                changed[at] = (byte)(value & 0xff); changed[at + 1] = (byte)(value >> 8);
+                ReplaceExe(exe, changed);
+            }
+            return Laa(folder).Patched ? "The change did not stick (another program may have restored the file)." : null;
+        }
+        catch (UnauthorizedAccessException) { return "The game folder is not writable. Run this launcher as administrator (right-click, Run as administrator)."; }
+        catch (Exception error) { return error.Message; }
+    }
+    public static string LastAttributeWarning;
+    static void ReplaceExe(string exe, byte[] bytes)
+    {
+        var attributes = File.GetAttributes(exe);
+        if ((attributes & FileAttributes.ReadOnly) != 0) File.SetAttributes(exe, attributes & ~FileAttributes.ReadOnly);
+        string temporary = null;
+        try
+        {
+            temporary = Stage(exe, bytes);
+            File.Replace(temporary, exe, null);
+        }
+        catch { if (temporary != null) Cleanup(temporary); throw; }
+        finally
+        {
+            try { File.SetAttributes(exe, attributes); } catch (Exception restore) { LastAttributeWarning = "The original file attributes of RoadRash95.exe could not be restored: " + restore.Message; }   // read-only comes back on every path
+        }
     }
 
     // ------------------------------------------------------------------ file operations
@@ -684,7 +920,7 @@ internal static class Installer
             if (!changed)
                 return Finish(game, restore ? "The game is already in its pre-install state." : "This version of MultiFix is already installed. Settings were updated.", false);
             return Finish(game, restore ? "ddraw.dll and RoadRashMultiFix.dll were removed (any earlier files were restored). RoadRashHD.ini was kept." :
-                "RoadRash30-MultiFix installed.\nRoadRash95.exe was not modified.\nLaunch the game as usual (GOG Galaxy, EA app, Steam or the desktop shortcut).\nYour saves are unchanged. Settings are in RoadRashHD.ini; if something looks wrong, check RoadRashHD.log in the game folder.", false);
+                "RoadRash30-MultiFix installed.\nRoadRash95.exe was not changed by this install (only the optional 4 GB switch touches it).\nLaunch the game as usual (GOG Galaxy, EA app, Steam or the desktop shortcut).\nYour saves are unchanged. Settings are in RoadRashHD.ini; if something looks wrong, check RoadRashHD.log in the game folder.", false);
         }
         catch (Exception error)
         {

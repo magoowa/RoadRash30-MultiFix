@@ -476,7 +476,7 @@ public:
     int horizonHeight() const { return horizonRows; }
 
 private:
-    static constexpr int STATIC_ATLAS = 4096, FRAME_ATLAS = 2048;
+    static constexpr int STATIC_ATLAS = 4096, FRAME_ATLAS = 4096;
     struct Shelf { int y, h, x; };
     struct Entry { uint32_t xy, sum; };
 

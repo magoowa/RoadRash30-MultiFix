@@ -8,7 +8,7 @@ A GOG-compatible rework of [OBLPlife/RoadRash30th-HD](https://github.com/OBLPlif
 
 **`RoadRash95.exe` is not modified by the patch.** The only exception is the optional "4 GB Memory" switch in the launcher (one flag in the executable, with a backup, off by default). The patch is a `ddraw.dll` proxy that the game loads from its own folder. It forwards all DirectDraw calls to the real system `ddraw.dll` and loads `RoadRashMultiFix.dll` at startup. The renderer checks the game code before hooking and does nothing on an executable it does not recognize (see `RoadRashHD.log`). Verified with the GOG build `60184028392664413` (SHA-256 `9e40e25737149ab095061b7154797a35495faea97644fafc5a1e616f1400c968`), which is byte-identical to the Steam build 26105967.
 
-![The MultiFix launcher](docs/launcher.png)
+![All launcher tabs](docs/launcher-tabs.gif)
 
 The launcher groups the options in tabs. Here is every tab (the animation below flips through them):
 
@@ -20,7 +20,6 @@ The launcher groups the options in tabs. Here is every tab (the animation below 
 | :---: | :---: |
 | ![Audio](docs/launcher-audio.png) | ![Controls](docs/launcher-controls.png) |
 
-![All launcher tabs](docs/launcher-tabs.gif)
 
 ## Install and Restore
 

@@ -42,6 +42,69 @@ static void proxyLog(const char* text) {
     if(h==INVALID_HANDLE_VALUE)return;
     DWORD written;WriteFile(h,text,DWORD(std::strlen(text)),&written,nullptr);WriteFile(h,"\r\n",2,&written,nullptr);CloseHandle(h);
 }
+// DirectDraw diagnostics (every platform): when CreateSurface, SetCooperativeLevel or SetDisplayMode of the game's DirectDraw object fail, one line
+// with the result code and the request goes to RoadRashHD_proxy.log next to this DLL (at most 24 lines), and the first calls are logged as well. The game
+// does not check these results; a surface that could not be created ends as a null pointer a little later.
+static volatile LONG g_diagLines;
+static void diagLog(const char* text) {
+    if(InterlockedIncrement(&g_diagLines)>24)return;
+    wchar_t path[MAX_PATH]{};
+    DWORD length=GetModuleFileNameW(g_self,path,MAX_PATH);
+    if(!length || length>=MAX_PATH)return;
+    std::wstring file(path,length);
+    file.resize(file.find_last_of(L"\\/")+1);
+    file+=L"RoadRashHD_proxy.log";
+    HANDLE h=CreateFileW(file.c_str(),FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(h==INVALID_HANDLE_VALUE)return;
+    DWORD written;WriteFile(h,text,DWORD(std::strlen(text)),&written,nullptr);WriteFile(h,"\r\n",2,&written,nullptr);CloseHandle(h);
+}
+typedef HRESULT (STDMETHODCALLTYPE *CreateSurfaceFn)(void*,void*,void**,void*);
+typedef HRESULT (STDMETHODCALLTYPE *CooperativeFn)(void*,HWND,DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *DisplayModeFn)(void*,DWORD,DWORD,DWORD);
+static CreateSurfaceFn g_createSurface;static CooperativeFn g_cooperative;static DisplayModeFn g_displayMode;
+static volatile LONG g_createCalls;
+static HRESULT STDMETHODCALLTYPE createSurfaceLogged(void* self,void* desc,void** surface,void* outer) {
+    HRESULT hr=g_createSurface(self,desc,surface,outer);
+    LONG call=InterlockedIncrement(&g_createCalls);
+    if(FAILED(hr) || call<=6) {
+        const uint32_t* d=reinterpret_cast<const uint32_t*>(desc);
+        char line[300];
+        // DDSURFACEDESC: size, flags, height, width at 0..12; pixel format flags / bit count at 76 and 84; caps at 104
+        if(d && d[0]==108)std::snprintf(line,sizeof line,"DirectDraw CreateSurface #%ld: result 0x%08lx, flags 0x%lx, %lux%lu, pixel format flags 0x%lx %lu bit, caps 0x%lx, surface %p",
+            long(call),unsigned long(hr),unsigned long(d[1]),unsigned long(d[3]),unsigned long(d[2]),unsigned long(d[19]),unsigned long(d[21]),unsigned long(d[26]),surface?*surface:nullptr);
+        else std::snprintf(line,sizeof line,"DirectDraw CreateSurface #%ld: result 0x%08lx (description size %lu)",long(call),unsigned long(hr),d?unsigned long(d[0]):0ul);
+        diagLog(line);
+    }
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE cooperativeLogged(void* self,HWND window,DWORD flags) {
+    HRESULT hr=g_cooperative(self,window,flags);
+    char line[160];std::snprintf(line,sizeof line,"DirectDraw SetCooperativeLevel flags 0x%lx: result 0x%08lx",unsigned long(flags),unsigned long(hr));diagLog(line);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE displayModeLogged(void* self,DWORD width,DWORD height,DWORD bits) {
+    HRESULT hr=g_displayMode(self,width,height,bits);
+    char line[160];std::snprintf(line,sizeof line,"DirectDraw SetDisplayMode %lux%lu, %lu bit: result 0x%08lx",unsigned long(width),unsigned long(height),unsigned long(bits),unsigned long(hr));diagLog(line);
+    return hr;
+}
+// Replaces slot `index` of the vtable of a DirectDraw object (the vtable lives in the system ddraw.dll and is shared by all its objects).
+static void hookSlot(void** vtable,int index,void* hook,void** original) {
+    if(vtable[index]==hook)return;
+    DWORD old;
+    if(!VirtualProtect(&vtable[index],sizeof(void*),PAGE_READWRITE,&old))return;
+    *original=vtable[index];vtable[index]=hook;
+    DWORD ignored;VirtualProtect(&vtable[index],sizeof(void*),old,&ignored);
+}
+static void watchDirectDraw(void* object) {
+    if(!object)return;
+    void** vtable=*reinterpret_cast<void***>(object);
+    if(!vtable)return;
+    if(vtable[6]==reinterpret_cast<void*>(&createSurfaceLogged))return;     // already done for this class
+    // IDirectDraw: 6 CreateSurface, 20 SetCooperativeLevel, 21 SetDisplayMode
+    hookSlot(vtable,6,reinterpret_cast<void*>(&createSurfaceLogged),reinterpret_cast<void**>(&g_createSurface));
+    hookSlot(vtable,20,reinterpret_cast<void*>(&cooperativeLogged),reinterpret_cast<void**>(&g_cooperative));
+    hookSlot(vtable,21,reinterpret_cast<void*>(&displayModeLogged),reinterpret_cast<void**>(&g_displayMode));
+}
 // A forwarded export that the system ddraw.dll does not have (or when it cannot be loaded) ends here instead of jumping to a null pointer.
 extern "C" HRESULT __cdecl missingExport() {return HRESULT(0x80004005);}
 // The system ddraw.dll is loaded exactly once; a thread that arrives while another one is loading waits here until g_real is complete.
@@ -65,6 +128,14 @@ static BOOL CALLBACK loadReal(PINIT_ONCE,PVOID,PVOID*) {
     std::snprintf(line,sizeof line,"proxy: system ddraw.dll at %p, DirectDrawCreate %p, DirectDrawCreateEx %p, %d exports missing",reinterpret_cast<void*>(real),
                   reinterpret_cast<void*>(g_real[8]),reinterpret_cast<void*>(g_real[10]),missing);
     proxyLog(line);
+    {   // one line about the platform: x86 game on an ARM64 Windows (Prism) is the case worth knowing
+        typedef BOOL (WINAPI* IsWow64Process2Fn)(HANDLE,USHORT*,USHORT*);
+        auto isWow64Process2=reinterpret_cast<IsWow64Process2Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"IsWow64Process2"));
+        USHORT process=0,machine=0;
+        if(isWow64Process2 && isWow64Process2(GetCurrentProcess(),&process,&machine)) {
+            std::snprintf(line,sizeof line,"proxy: process machine 0x%x, native machine 0x%x, system ddraw.dll %s",unsigned(process),unsigned(machine),real?"loaded":"NOT loaded");diagLog(line);
+        }
+    }
     return TRUE;
 }
 extern "C" void __cdecl ensureReal() {InitOnceExecuteOnce(&g_realOnce,loadReal,nullptr,nullptr);}
@@ -134,7 +205,10 @@ extern "C" HRESULT WINAPI DirectDrawCreate(void* guid,void** directDraw,void* ou
     initializeRenderer(); // No-op when the entry hook already ran.
     ensureReal();
     if(g_real[8]==reinterpret_cast<FARPROC>(&missingExport)){proxyLog("proxy: DirectDrawCreate of the system ddraw.dll not found");return HRESULT(0x80004005);}
-    return reinterpret_cast<HRESULT(WINAPI*)(void*,void**,void*)>(g_real[8])(guid,directDraw,outer);
+    HRESULT hr=reinterpret_cast<HRESULT(WINAPI*)(void*,void**,void*)>(g_real[8])(guid,directDraw,outer);
+    if(SUCCEEDED(hr) && directDraw)watchDirectDraw(*directDraw);
+    else if(FAILED(hr)){char line[120];std::snprintf(line,sizeof line,"DirectDrawCreate failed: 0x%08lx",unsigned long(hr));diagLog(line);}
+    return hr;
 }
 
 #define FORWARD(ordinal,name) \

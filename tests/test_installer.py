@@ -125,6 +125,41 @@ def run(original_dir):
         assert not (conflict / 'RoadRashMultiFix.dll').exists()
         checks.append('conflicting backup retained')
 
+        # the compatibility loader: msimg32.dll instead of ddraw.dll (the system ddraw.dll is then used as without a patch)
+        msimg_proxy = (build / 'msimg32.dll').read_bytes()
+        loader = fixture('msimg32 loader')
+        execute(loader, '/loader:msimg32')
+        assert (loader / 'msimg32.dll').read_bytes() == msimg_proxy and (loader / 'RoadRashMultiFix.dll').read_bytes() == renderer
+        assert not (loader / 'ddraw.dll').exists()
+        assert 'already installed' in execute(loader), 'a later install keeps the loader in use'
+        assert (loader / 'msimg32.dll').exists() and not (loader / 'ddraw.dll').exists()
+        execute(loader, '/loader:ddraw')
+        assert (loader / 'ddraw.dll').read_bytes() == proxy and not (loader / 'msimg32.dll').exists()
+        execute(loader, '/loader:msimg32')
+        assert not (loader / 'ddraw.dll').exists() and (loader / 'msimg32.dll').exists()
+        execute(loader, '/restore')
+        assert not (loader / 'msimg32.dll').exists() and not (loader / 'ddraw.dll').exists() and not (loader / 'RoadRashMultiFix.dll').exists()
+        other = fixture('msimg32 loader with a foreign ddraw wrapper')
+        (other / 'ddraw.dll').write_bytes(wrapper)
+        execute(other, '/loader:msimg32')
+        assert (other / 'ddraw.dll').read_bytes() == wrapper and not (other / 'ddraw.dll.multifix-backup').exists()
+        execute(other, '/restore')
+        assert (other / 'ddraw.dll').read_bytes() == wrapper and not (other / 'msimg32.dll').exists()
+        swapped = fixture('foreign msimg32')
+        (swapped / 'msimg32.dll').write_bytes(b'someone elses msimg32')
+        execute(swapped, '/loader:msimg32')
+        assert (swapped / 'msimg32.dll.multifix-backup').read_bytes() == b'someone elses msimg32'
+        execute(swapped, '/restore')
+        assert (swapped / 'msimg32.dll').read_bytes() == b'someone elses msimg32' and not (swapped / 'msimg32.dll.multifix-backup').exists()
+        # switching from the ddraw.dll proxy over a saved foreign ddraw.dll puts the foreign one back
+        back = fixture('loader switch restores a foreign ddraw wrapper')
+        (back / 'ddraw.dll').write_bytes(wrapper)
+        execute(back)
+        assert (back / 'ddraw.dll').read_bytes() == proxy and (back / 'ddraw.dll.multifix-backup').read_bytes() == wrapper
+        execute(back, '/loader:msimg32')
+        assert (back / 'ddraw.dll').read_bytes() == wrapper and not (back / 'ddraw.dll.multifix-backup').exists() and (back / 'msimg32.dll').exists()
+        checks.append('compatibility loader: msimg32.dll installed, kept, switched back and forth and restored; foreign files untouched or backed up')
+
         # an install made by an earlier version (backup folder with a saved original) is migrated and the folder removed
         migrated = fixture('older install with a backup folder')
         (migrated / 'ResolutionPatch_Backup').mkdir()

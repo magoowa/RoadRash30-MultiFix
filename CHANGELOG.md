@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.20.5
+
+**Fixes**
+- **Keep Completed Tracks (2.20.0) removed; the victory screen no longer hangs.** The game asks whether all five tracks of the last level are done every time it goes to the home screen, shows the ending when they are, and clears the marks. Keeping them (2.20.0 put them back at once) made it show the ending again and again, and the game stayed on the victory screen after level 5. There is no way to keep the marks without that loop, so the game behaves as before: after the ending the marks are cleared. A leftover `KeepCompletedTracks` line in `RoadRashHD.ini` is ignored.
+- **Animation crash** (one frame table with garbage in it, for example at mile 9.3 of the level 3 City course, `RoadRash95.exe+0x1bf8e`): that sprite is skipped instead of ending the game. The second frame selector of the game is guarded like the first one (the Peninsula fix of 1.1.1); a line in `RoadRashHD.log` says when it happened.
+- **Police siren** was played at -90 to -100 dB (silent). New **Police Siren Loudness** slider (Audio tab, `[Audio] PoliceSirenLoudness`, default 80) removes that percentage of the attenuation.
+- **Compatibility Loader** (launcher switch): loads MultiFix through `msimg32.dll` instead of the `ddraw.dll` proxy. On Windows 11 on ARM in a virtual machine the system DirectDraw refused to create the 8-bit surface of the race HUD when the proxy was in the game folder, and the game closed at the start of a race; with this loader Windows uses its own `ddraw.dll`. `RoadRashHD_proxy.log` records failed DirectDraw calls.
+
 ## 2.20.0
 
 **Launcher**

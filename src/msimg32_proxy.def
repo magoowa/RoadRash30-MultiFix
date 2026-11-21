@@ -1,0 +1,8 @@
+; SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+LIBRARY msimg32
+EXPORTS
+    AlphaBlend=fwd_AlphaBlend @1
+    DllInitialize=fwd_DllInitialize @2
+    GradientFill=fwd_GradientFill @3
+    TransparentBlt=fwd_TransparentBlt @4
+    vSetDdrawflag=fwd_vSetDdrawflag @5

@@ -915,7 +915,44 @@ uint8_t* __fastcall animationFrameHook(uint8_t* animation,int sequence,int frame
         }
         return nullptr;
     }
-    return fn<AnimationFrame>(0x41be80)(animation,sequence,frame,duration);
+    // The same unchecked table header as in frameTableHook: the original reads [table+8] and then the frame count at header+0x10 (0x41bf0c).
+    uint8_t* result=nullptr;bool ok=true;
+    ++probeDepth;
+    __try {result=fn<AnimationFrame>(0x41be80)(animation,sequence,frame,duration);}
+    __except(EXCEPTION_EXECUTE_HANDLER) {ok=false;}
+    --probeDepth;
+    if(!ok) {
+        if(duration)*duration=0;
+        static volatile LONG reported=0;
+        if(InterlockedIncrement(&reported)<=3){char message[160];std::snprintf(message,sizeof message,"animation: the frame table of sequence %d frame %d is unusable; that frame is skipped",sequence,frame);status(message);}
+        return nullptr;
+    }
+    return result;
+}
+// The second frame selector (0x41bf50, reached through the thunk 0x4012fd; ecx = frame table, edx = frame index; callers 0x45ce7c, 0x4667b9, 0x466fcf)
+// reads the table's header pointer at +8 and the frame count at header+0x10. A table whose header pointer is garbage (reported: 0x14, at one spot of the City
+// course, "RoadRash95.exe+0x1bf8e, read from 0x24", every time) crashed the game. Like the first selector it returns null for "no frame", which all three
+// callers test, so an unusable table skips that actor's draw instead of ending the game.
+using FrameTableFn=uint8_t* (__fastcall*)(uint8_t*,int);
+uint8_t* __fastcall frameTableHook(uint8_t* table,int frame) {
+    auto original=fn<FrameTableFn>(0x41bf50);
+    if(!table)return original(table,frame);
+    uint8_t* result=nullptr;bool ok=true;
+    ++probeDepth;
+    __try {result=original(table,frame);}
+    __except(EXCEPTION_EXECUTE_HANDLER) {ok=false;}
+    --probeDepth;
+    if(!ok) {
+        static volatile LONG reported=0;
+        if(InterlockedIncrement(&reported)<=5) {
+            int header=0;if(!readInt(table+8,&header))header=-1;
+            char message[200];std::snprintf(message,sizeof message,"animation: the frame table at %p (frame %d) is unusable, header pointer 0x%08x; that frame is skipped",
+                static_cast<void*>(table),frame,unsigned(header));
+            status(message);
+        }
+        return nullptr;
+    }
+    return result;
 }
 // Every write into the game's code is remembered (address and the bytes that were there), so a patch group that fails half way can be undone.
 struct PatchRecord {uintptr_t address;std::vector<uint8_t> original;};
@@ -2176,6 +2213,7 @@ HMMIO WINAPI mmioOpenHook(LPSTR name,LPMMIOINFO info,DWORD flags) {
 struct SoundInfo{std::string name;LONG volume=0;bool volumeSet=false;};
 std::unordered_map<void*,SoundInfo> soundBuffers;
 bool audioTrace=false;   // [Debug] AudioTrace: logs the calls that can change the volume of the whole game in the Windows mixer
+int sirenRelief=80;   // [Audio] PoliceSirenLoudness: how much of the siren's attenuation is removed, percent
 int soundLogged=0,pedestrianRelief=60,pedestrianVoiceRelief=100,pedestrianVoiceGapMs=120;bool femaleVoiceFallback=true;DWORD soundStart=GetTickCount();
 using CreateBufferFn=HRESULT(STDMETHODCALLTYPE*)(void*,const DSBUFFERDESC*,LPDIRECTSOUNDBUFFER*,IUnknown*);
 using DuplicateBufferFn=HRESULT(STDMETHODCALLTYPE*)(void*,LPDIRECTSOUNDBUFFER,LPDIRECTSOUNDBUFFER*);
@@ -2224,6 +2262,8 @@ HRESULT STDMETHODCALLTYPE bufferSetVolumeHook(void* self,LONG volume) {
             if(!voice && _strnicmp(n.c_str(),"grunt",5)==0)relief=0;
             if(relief>0)volume=LONG(volume*(100-relief)/100);
         }
+        // The police siren (SIREN.WAV, SIRENFST.WAV) is played by the game at -90 to -100 dB, which cannot be heard. The attenuation is reduced like the pedestrians'.
+        if(_strnicmp(s->second.name.c_str(),"siren",5)==0 && volume<0 && sirenRelief>0)volume=LONG(volume*(100-sirenRelief)/100);
         s->second.volume=volume;s->second.volumeSet=true;
     }
     std::string traceName;
@@ -3276,12 +3316,6 @@ int __cdecl odometerValue() {
     return driven>9999?9999:driven;
 }
 
-// Keep completed tracks ([Game] KeepCompletedTracks, on by default). The save keeps one bit per completed track (0x6041a3). When the
-// fifth track of the last level is won (mask 0x1f) the game clears the mask and shows the ending (0x437887 and the same code at
-// 0x43869b: "mov [0x6041a3],0 ... mov eax,0x24"), so a finished game looks as if no track had been completed. At the last level the
-// call below restores the five bits and returns the same value (0x24) the game returned.
-bool keepCompletedTracks=true;
-int __cdecl finalLevelDone() {at<uint8_t>(0x6041a3)=0x1f;return 0x24;}
 
 bool initialize(HMODULE module) {
     base=reinterpret_cast<uintptr_t>(module);journaling=true;
@@ -3289,6 +3323,7 @@ bool initialize(HMODULE module) {
     struct Hook {uintptr_t thunk,original;void* hook;};
     Hook hooks[]={
         {0x401a2d,0x41be80,reinterpret_cast<void*>(&animationFrameHook)},
+        {0x4012fd,0x41bf50,reinterpret_cast<void*>(&frameTableHook)},
         {0x4058da,0x45ac50,reinterpret_cast<void*>(&frameHook)},
         {0x40132f,0x4688e0,reinterpret_cast<void*>(&listHook)},
         {0x4049a3,0x467b80,reinterpret_cast<void*>(&worldPresentHook)},
@@ -3315,15 +3350,6 @@ bool initialize(HMODULE module) {
             if(!good)rollbackPatches(journalMark,"odometer");
             status(good?(distanceToFinish?"odometer: full range, distance to the finish":"odometer: full range (no wrap at 25.5)"):"odometer patch failed");
         } else status("odometer fix ignored: unexpected HUD code");
-    }
-    if(keepCompletedTracks) {
-        const uintptr_t sites[]={0x4378a7,0x4386ed};
-        bool match=true;
-        for(auto site:sites)match=match && at<uint8_t>(site)==0xb8 && at<uint32_t>(site+1)==0x24;
-        for(uintptr_t clear:{0x43789c,0x4386e2})match=match && at<uint8_t>(clear)==0xc6 && at<uint8_t>(clear+1)==0x05 && at<uintptr_t>(clear+2)==base+0x2041a3 && at<uint8_t>(clear+6)==0;
-        const size_t journalMark=patchJournal.size();
-        if(match){bool good=true;for(auto site:sites)good=branch(site,reinterpret_cast<void*>(&finalLevelDone),0xe8)&&good;if(!good)rollbackPatches(journalMark,"keep completed tracks");status(good?"completed tracks are kept after the last level":"keep completed tracks: patch failed");}
-        else status("keep completed tracks ignored: unexpected code");
     }
     if(smoothRoad) {
         const uintptr_t sites[]={0x459dcb,0x459f56,0x459f65,0x45a138,0x45a147,0x45a360};
@@ -3711,7 +3737,6 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
     if(videoVolume<0)videoVolume=0;if(videoVolume>100)videoVolume=100;
     fullRateObjects=GetPrivateProfileIntW(L"Game",L"FullRateObjects",1,configPath.c_str())!=0;
     smoothRoad=GetPrivateProfileIntW(L"Game",L"SmoothRoad",1,configPath.c_str())!=0;
-    keepCompletedTracks=GetPrivateProfileIntW(L"Game",L"KeepCompletedTracks",1,configPath.c_str())!=0;
     distanceToFinish=GetPrivateProfileIntW(L"Game",L"DistanceToFinish",0,configPath.c_str())!=0;
     // Pedestrian loudness ([Audio] PedestrianLoudness, percent, launcher slider): how much of the boost below is applied. 0 = the game's own
     // levels, 100 = the full boost the earlier versions had, 67 (default) = two thirds of it. LouderPedestrians=0 still switches everything off.
@@ -3720,6 +3745,7 @@ extern "C" __declspec(dllexport) void __cdecl RRHD_Init(HMODULE module) {
         if(GetPrivateProfileIntW(L"Audio",L"LouderPedestrians",1,configPath.c_str())==0)loudness=0;
         quietEffects=loudness>0;
         quietGainDb=std::max(0,std::min(12,int(GetPrivateProfileIntW(L"Audio",L"PedestrianGainDb",3,configPath.c_str()))))*loudness;
+        sirenRelief=std::max(0,std::min(100,int(GetPrivateProfileIntW(L"Audio",L"PoliceSirenLoudness",80,configPath.c_str()))));
         pedestrianRelief=int(std::lround(std::max(0,std::min(100,int(GetPrivateProfileIntW(L"Audio",L"PedestrianVolumeRelief",60,configPath.c_str()))))*loudness));
         pedestrianVoiceRelief=int(std::lround(std::max(0,std::min(100,int(GetPrivateProfileIntW(L"Audio",L"PedestrianVoiceRelief",100,configPath.c_str()))))*loudness));
     }

@@ -29,6 +29,7 @@ internal sealed class PatchWindow : Form
     readonly List<SliderRow> sliderRows = new List<SliderRow>();
     readonly List<TableLayoutPanel> pageTables = new List<TableLayoutPanel>();
     TabControl tabs; Control musicHelpRow; TableLayoutPanel musicHelpTable;
+    TableLayoutPanel loaderTable; CheckBox loaderBox; Label loaderHint;      // how MultiFix is loaded: ddraw.dll (default) or msimg32.dll
     TableLayoutPanel laaTable; CheckBox laaBox; Label laaHint;      // the 4 GB (Large Address Aware) switch above the tabs
     string latestNetplay;                                            // newest okplay version known from GitHub / oldkid.net
     readonly FlowLayoutPanel languageRow = new FlowLayoutPanel();   // one radio button per language
@@ -124,11 +125,22 @@ internal sealed class PatchWindow : Form
         laaTable.Controls.Add(laaBox, 0, 0); laaTable.Controls.Add(laaHint, 1, 0);
         root.Controls.Add(laaTable);
 
+        // The compatibility loader: MultiFix is loaded through msimg32.dll instead of a ddraw.dll proxy (Windows on ARM and some virtual machines crash at the start of a race with the ddraw.dll one).
+        loaderTable = new TableLayoutPanel { Name = "LoaderBlock", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, m) };
+        loaderTable.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); loaderTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        loaderBox = new CheckBox { Name = "LoaderBox", Text = "Compatibility Loader (msimg32.dll)", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, rg, m, rg) };
+        loaderHint = new Label { Name = "LoaderHint", Text = "", AutoSize = true, ForeColor = SystemColors.GrayText, Anchor = AnchorStyles.Left, Margin = new Padding(0, rg, 0, rg) };
+        tips.SetToolTip(loaderBox, "Loads MultiFix through msimg32.dll instead of ddraw.dll, so Windows uses its own ddraw.dll as without any patch. Turn it on if the game closes when a race starts " +
+                                    "(seen on Windows 11 on ARM and in virtual machines). The files in the game folder change when you press Install / Update (at once if MultiFix is already installed).");
+        loaderBox.CheckedChanged += LoaderChanged;
+        loaderTable.Controls.Add(loaderBox, 0, 0); loaderTable.Controls.Add(loaderHint, 1, 0);
+        root.Controls.Add(loaderTable);
+
         // The options, grouped in tabs (Stability first). Every option has its own row and is read from / written to RoadRashHD.ini as it changes.
         tabs = new TabControl { Name = "OptionsTabs", Dock = DockStyle.Fill, Multiline = true, Margin = new Padding(0, 0, 0, m), Padding = new Point(Px(10), Px(3)) };
         foreach (string category in Installer.Categories)
         {
-            var page = new TabPage(category) { Name = "Tab_" + category.Replace(' ', '_'), UseVisualStyleBackColor = true, Padding = new Padding(m / 2) };
+            var page = new TabPage(category) { Name = "Tab_" + category.Replace(' ', '_'), UseVisualStyleBackColor = false, BackColor = Color.White, Padding = new Padding(m / 2) };
             var rows = new TableLayoutPanel { Name = "OptionsTable_" + category.Replace(' ', '_'), AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, Dock = DockStyle.Top, Margin = new Padding(0) };
             rows.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); rows.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             int r = 0;
@@ -145,17 +157,20 @@ internal sealed class PatchWindow : Form
             }
             // Sliders: the name under the option names (lined up with their text), the slider and its value in the column of the descriptions,
             // the description on the next line.
+            bool firstSlider = true;
             foreach (var slider in Installer.Sliders)
             {
                 if (slider.Category != category) continue;
                 var row = new SliderRow { Slider = slider };
-                row.Name = new Label { Text = slider.Label, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(Px(13), rg, m, rg) };
+                int gapAbove = firstSlider && r > 0 ? rg * 5 : 0;      // the sliders start a little below the check boxes
+                firstSlider = false;
+                row.Name = new Label { Text = slider.Label, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(Px(13), rg + gapAbove, m, rg) };
                 row.Bar = new TrackBar { Name = "Slider_" + slider.Section + "_" + slider.Key, Minimum = slider.Min, Maximum = slider.Max, TickFrequency = 10, SmallChange = 5, LargeChange = 10, Value = slider.Default,
-                                         AutoSize = false, Size = new Size(Px(190), Px(42)), Margin = new Padding(0, 0, m, 0), Tag = row };
-                row.Value = new Label { Name = "SliderText_" + slider.Section + "_" + slider.Key, Text = slider.Default + " %", AutoSize = true, Anchor = AnchorStyles.Left, MinimumSize = new Size(Px(44), 0) };
+                                         AutoSize = false, Size = new Size(Px(190), Px(30)), Margin = new Padding(0, gapAbove, m, 0), Tag = row, BackColor = Color.White };
+                row.Value = new Label { Margin = new Padding(3, gapAbove, 3, 0), Name = "SliderText_" + slider.Section + "_" + slider.Key, Text = slider.Default + " %", AutoSize = true, Anchor = AnchorStyles.Left, MinimumSize = new Size(Px(44), 0) };
                 row.Line = new FlowLayoutPanel { Name = "SliderLine_" + slider.Key, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Margin = new Padding(0) };
                 row.Line.Controls.Add(row.Bar); row.Line.Controls.Add(row.Value);
-                row.Hint = new Label { Text = slider.Hint, AutoSize = true, ForeColor = SystemColors.GrayText, Anchor = AnchorStyles.Left, Margin = new Padding(0, rg, 0, rg) };
+                row.Hint = new Label { Text = slider.Hint, AutoSize = true, ForeColor = SystemColors.GrayText, Anchor = AnchorStyles.Left, Margin = new Padding(0, 0, 0, rg) };
                 tips.SetToolTip(row.Bar, slider.Section + "/" + slider.Key + " - " + slider.Hint);
                 row.Bar.ValueChanged += SliderChanged;
                 sliderRows.Add(row);
@@ -394,6 +409,11 @@ internal sealed class PatchWindow : Form
         laaTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
         laaBox.Margin = new Padding(0, rg * 2, 0, 0); laaHint.Margin = new Padding(indent, 0, 0, rg);
         laaTable.Controls.Add(laaBox, 0, 0); laaTable.Controls.Add(laaHint, 0, 1); laaTable.ResumeLayout(true);
+        loaderHint.MaximumSize = new Size(text - Px(30), 0);
+        loaderTable.SuspendLayout(); loaderTable.Controls.Clear(); loaderTable.ColumnStyles.Clear(); loaderTable.ColumnCount = 1;
+        loaderTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        loaderBox.Margin = new Padding(0, rg * 2, 0, 0); loaderHint.Margin = new Padding(indent, 0, 0, rg);
+        loaderTable.Controls.Add(loaderBox, 0, 0); loaderTable.Controls.Add(loaderHint, 0, 1); loaderTable.ResumeLayout(true);
         installs.MaximumSize = new Size(Math.Max(Px(100), infoWrap - Px(70)), 0);
         // info block: the language buttons wrap
         languageRow.WrapContents = true; languageRow.MaximumSize = new Size(infoWrap, 0);
@@ -514,6 +534,39 @@ internal sealed class PatchWindow : Form
             else laaHint.Text = "Not patched - the game gets 2 GB of memory. Changes RoadRash95.exe; a backup is made";
         }
         finally { loading = wasLoading; }
+    }
+    // The loader switch shows how MultiFix is loaded in the game folder; with MultiFix installed a change is applied at once (the same as Install / Update).
+    void RefreshLoader()
+    {
+        if (loaderBox == null) return;
+        var state = Installer.Status(path.Text);
+        bool wasLoading = loading; loading = true;
+        try
+        {
+            if (state.Installed) loaderBox.Checked = state.Msimg32Ours;
+            loaderHint.Text = state.Installed
+                ? (state.Msimg32Ours ? "On - Windows uses its own ddraw.dll; MultiFix is loaded through msimg32.dll"
+                                     : "Off - MultiFix is loaded through ddraw.dll. For Windows on ARM or a virtual machine where the game closes when a race starts")
+                : (loaderBox.Checked ? "Applied by Install / Update" : "Off - MultiFix will be loaded through ddraw.dll. For Windows on ARM or a virtual machine where the game closes at the start of a race");
+        }
+        finally { loading = wasLoading; }
+    }
+    void LoaderChanged(object sender, EventArgs e)
+    {
+        if (loading) return;
+        if (!Installer.Status(path.Text).Installed) { RefreshLoader(); return; }
+        PatchResult result;
+        UseWaitCursor = true;
+        try
+        {
+            var options = new Dictionary<string, bool>();
+            foreach (var box in boxes) { var o = (PatchOption)box.Tag; options[o.Section + "/" + o.Key] = box.Checked; }
+            options[Installer.LoaderKey] = loaderBox.Checked;
+            result = Installer.Execute(false, path.Text, options);
+        }
+        finally { UseWaitCursor = false; }
+        RefreshInfo();
+        if (!result.Success) MessageBox.Show(this, result.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
     void LaaChanged(object sender, EventArgs e)
     {
@@ -737,6 +790,7 @@ internal sealed class PatchWindow : Form
         infoTable.ResumeLayout();
         bool game = System.IO.File.Exists(System.IO.Path.Combine(path.Text ?? "", "RoadRash95.exe"));
         play.Enabled = install.Enabled = restore.Enabled = game;
+        RefreshLoader();
         Refit();
     }
     void Play()
@@ -752,6 +806,7 @@ internal sealed class PatchWindow : Form
             {
                 var options = new Dictionary<string, bool>();
                 foreach (var box in boxes) { var o = (PatchOption)box.Tag; options[o.Section + "/" + o.Key] = box.Checked; }
+                options[Installer.LoaderKey] = loaderBox.Checked;
                 var result = Installer.Execute(false, path.Text, options);
                 RefreshInfo();
                 if (!result.Success) MessageBox.Show(this, result.Message + "\n\nThe game will start without the update.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -770,6 +825,7 @@ internal sealed class PatchWindow : Form
         {
             var options = new Dictionary<string, bool>();
             foreach (var box in boxes) { var o = (PatchOption)box.Tag; options[o.Section + "/" + o.Key] = box.Checked; }
+            options[Installer.LoaderKey] = loaderBox.Checked;
             result = Installer.Execute(restoring, path.Text, options);
             if (restoring && Installer.Laa(path.Text).Patched)
             {

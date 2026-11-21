@@ -93,6 +93,45 @@ int wmain(int argc,wchar_t** argv) {
         require(std::memcmp(expectedContext,fixture.context,sizeof expectedContext)==0,"valid animation writes are unchanged");
         ++valid;
     }
-    std::printf("animation: %u original failures at +0x1bed2 prevented; %u valid frame selections unchanged; actual DLL tested\n",failures,valid);
+    // The first selector with a valid kind but a garbage table header (runtime+8): the original crashes at +0x1bf0c, the fixed thunk returns no frame.
+    for(unsigned kind=1;kind<=4;++kind) {
+        fixture.reset(kind);field<uint32_t>(fixture.runtime,8)=0x14;int duration=-1;Fault fault;
+        invoke(original,fixture.object,0,0,&duration,&fault);
+        require(fault.code==EXCEPTION_ACCESS_VIOLATION && fault.instruction-image==0x1bf0c,"original reproduces the table header crash of the first selector");
+        fixture.reset(kind);field<uint32_t>(fixture.runtime,8)=0x14;duration=-1;fault={};
+        require(invoke(fixed,fixture.object,0,0,&duration,&fault)==nullptr && !fault.code && duration==0,"fixed first selector returns no frame for an unusable table");
+        ++failures;
+    }
+    // The second frame selector (0x41bf50 through the thunk 0x4012fd): a frame table whose header pointer is garbage (0x14 in the report) crashed
+    // at +0x1bf8e reading 0x24; the fixed thunk returns null, valid tables give the same result as the original.
+    {
+        using Table=uint8_t* (__fastcall*)(uint8_t*,int);
+        auto originalTable=reinterpret_cast<Table>(image+0x1bf50);auto fixedTable=reinterpret_cast<Table>(image+0x12fd);
+        alignas(4) uint8_t table[8*28],header[32],target[0x60];
+        auto build=[&](uint32_t headerPointer) {
+            std::memset(table,0,sizeof table);std::memset(header,0,sizeof header);std::memset(target,0,sizeof target);
+            field<uint8_t*>(table,12)=target;field<uint32_t>(table,8)=headerPointer;field<int>(header,16)=6;
+            for(int i=1;i<=2;++i){field<int>(table,i*28+4)=0x500+i;field<int>(table,i*28+20)=0;field<int>(table,i*28+24)=1;}
+        };
+        auto call=[&](Table fn,uint8_t* t,int frame,Fault* fault)->uint8_t* {
+            __try {return fn(t,frame);} __except(capture(GetExceptionInformation(),fault)){return nullptr;}
+        };
+        for(uint32_t bad:{0x14u,0u,0xfffffff0u}) {
+            build(bad);Fault fault;call(originalTable,table,1,&fault);
+            require(fault.code==EXCEPTION_ACCESS_VIOLATION && fault.instruction-image==0x1bf8e,"original reproduces the reported frame table crash");
+            build(bad);Fault none;
+            require(call(fixedTable,table,1,&none)==nullptr && !none.code,"fixed frame selector returns no frame for an unusable table");
+            ++failures;
+        }
+        build(uint32_t(reinterpret_cast<uintptr_t>(header)));Fault f1;
+        uint8_t* expected=call(originalTable,table,1,&f1);
+        require(!f1.code && expected==table+2*28,"valid frame table fixture");
+        uint8_t expectedTarget[sizeof target];std::memcpy(expectedTarget,target,sizeof target);
+        build(uint32_t(reinterpret_cast<uintptr_t>(header)));Fault f2;
+        require(call(fixedTable,table,1,&f2)==expected && !f2.code && std::memcmp(expectedTarget,target,sizeof target)==0,"valid frame tables give identical results and writes");
+        require(call(fixedTable,nullptr,1,&f2)==nullptr,"a null table still gives no frame");
+        ++valid;
+    }
+    std::printf("animation: %u original failures (+0x1bed2, +0x1bf8e) prevented; %u valid frame selections unchanged; actual DLL tested\n",failures,valid);
     return 0;
 }

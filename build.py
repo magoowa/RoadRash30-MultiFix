@@ -78,7 +78,10 @@ def build(vcvarsall, tests, release=False):
                 '/DEF:src\\hd_renderer.def build\\hd_menu.res build\\renderer_version.res user32.lib gdi32.lib advapi32.lib ole32.lib', 'if errorlevel 1 exit /b 1',
                 'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /LD src\\ddraw_proxy.cpp '
                 '/Fo:build\\ddraw_proxy.obj /Fe:build\\ddraw.dll /link /Brepro '
-                '/DEF:src\\ddraw_proxy.def build\\ddraw_version.res user32.lib', 'if errorlevel 1 exit /b 1']
+                '/DEF:src\\ddraw_proxy.def build\\ddraw_version.res user32.lib', 'if errorlevel 1 exit /b 1',
+                'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /LD src\\msimg32_proxy.cpp '
+                '/Fo:build\\msimg32_proxy.obj /Fe:build\\msimg32.dll /link /Brepro '
+                '/DEF:src\\msimg32_proxy.def user32.lib', 'if errorlevel 1 exit /b 1']
     if tests:
         for name in ['hd_test', 'hd_loader_test', 'hd_perf_test', 'hd_animation_test', 'hd_gpu_test', 'hd_proxy_threads_test']:
             commands.extend([f'cl /nologo /std:c++17 /O2 /MT /EHsc /W4 /utf-8 /I build tests\\{name}.cpp '
@@ -96,6 +99,7 @@ def build(vcvarsall, tests, release=False):
                     '/out:' + str(exe), '/win32manifest:' + str(ROOT / 'app.manifest'),
                     '/resource:' + str(work / 'RoadRashMultiFix.dll') + ',RoadRashMultiFix.dll',
                     '/resource:' + str(work / 'ddraw.dll') + ',ddraw.dll',
+                    '/resource:' + str(work / 'msimg32.dll') + ',msimg32.dll',
                     '/resource:' + str(ROOT / 'app.ico') + ',app.ico',
                     '/resource:' + str(ROOT / 'docs/logo.png') + ',logo.png',
                     '/resource:' + str(ROOT / 'RoadRashHD.ini') + ',RoadRashHD.ini',

@@ -52,7 +52,10 @@ internal static class Installer
     // A different file that was in the way is kept next to the new one, e.g. ddraw.dll.multifix-backup.
     const string BackupSuffix = ".multifix-backup";
     // Files this installer owns. Both are embedded in the installer.
-    static readonly string[] Managed = { "ddraw.dll", "RoadRashMultiFix.dll" };
+    static readonly string[] Managed = { "ddraw.dll", "RoadRashMultiFix.dll", "msimg32.dll" };
+    // Two ways to get the renderer into the game: the ddraw.dll proxy (default) or the msimg32.dll proxy (the game imports AlphaBlend from it). With the second one
+    // Windows loads its own ddraw.dll in the usual way; needed on some systems (Windows on ARM in a virtual machine), where the game crashes when a race starts.
+    public const string LoaderKey = "Loader/Msimg32";
 
     // Executables the patch was verified with. Anything else is still allowed (the
     // renderer checks the game code itself and does nothing on a mismatch).
@@ -112,6 +115,7 @@ internal static class Installer
     public static readonly PatchSlider[] Sliders =
     {
         new PatchSlider("Audio", "PedestrianLoudness", "Pedestrian Loudness", "Voices and footsteps of pedestrians: 0 = the game's own levels, 100 = the full boost of earlier versions", 0, 100, 67, "Audio"),
+        new PatchSlider("Audio", "PoliceSirenLoudness", "Police Siren Loudness", "The police siren: 0 = the game's own level (almost silent), 100 = full volume next to the police", 0, 100, 80, "Audio"),
         new PatchSlider("Game", "VideoVolume", "FMV Volume", "Volume of the intro and story videos (.avi and .mp4)", 0, 100, 100, "Audio")
     };
     static Installer()
@@ -282,16 +286,16 @@ internal static class Installer
     // What is in the game folder: our ddraw.dll proxy and the renderer DLL, and the renderer's version.
     public sealed class PatchStatus
     {
-        public bool ProxyOurs, ProxyPresent, RendererPresent, RendererCurrent;
+        public bool ProxyOurs, ProxyPresent, RendererPresent, RendererCurrent, Msimg32Ours;
         public string RendererVersion = "", RendererBuild = "";
         public bool Installed { get { return ProxyOurs && RendererPresent; } }
         public bool Outdated { get { return Installed && !RendererCurrent; } }
         public string Describe()
         {
             if (Installed)
-                return RendererCurrent ? "installed, DLL version " + RendererVersion + (RendererBuild != "" ? " test " + RendererBuild : "") + " (up to date)"
+                return RendererCurrent ? "installed, DLL version " + RendererVersion + (RendererBuild != "" ? " test " + RendererBuild : "") + " (up to date)" + (Msimg32Ours ? ", loaded through msimg32.dll" : "")
                     : "installed, DLL version " + (RendererVersion != "" ? RendererVersion : "unknown") + " (this launcher has " + ModInfo.Version + " - press Install / Update)";
-            if (ProxyPresent && !ProxyOurs) return "NOT installed - the game folder has a different ddraw.dll (another wrapper?); Install backs it up";
+            if (ProxyPresent && !ProxyOurs && !Msimg32Ours) return "NOT installed - the game folder has a different ddraw.dll (another wrapper?); Install backs it up";
             if (ProxyOurs || RendererPresent) return "partially installed (a MultiFix file is missing) - press Install / Update";
             return "NOT installed";
         }
@@ -305,6 +309,9 @@ internal static class Installer
             string proxy = Path.Combine(folder, "ddraw.dll"), renderer = Path.Combine(folder, "RoadRashMultiFix.dll");
             s.ProxyPresent = File.Exists(proxy);
             s.ProxyOurs = s.ProxyPresent && (HashFile(proxy) == Hash(Resource("ddraw.dll")) || IsOurProxy(File.ReadAllBytes(proxy)) || Directory.Exists(Path.Combine(folder, LegacyBackupFolder)));
+            string msimg = Path.Combine(folder, "msimg32.dll");
+            s.Msimg32Ours = File.Exists(msimg) && IsOurProxy(File.ReadAllBytes(msimg));
+            if (s.Msimg32Ours) s.ProxyOurs = true;
             s.RendererPresent = File.Exists(renderer);
             if (s.RendererPresent)
             {
@@ -797,7 +804,7 @@ internal static class Installer
         byte[] before = Read(path);
         if (!Same(before, after)) operations.Add(new Operation { Path = path, Before = before, After = after });
     }
-    static List<Operation> Prepare(Game game, bool restore)
+    static List<Operation> Prepare(Game game, bool restore, bool msimg)
     {
         string exePath = Path.Combine(game.Root, ExeName);
         if (!File.Exists(exePath))
@@ -811,12 +818,15 @@ internal static class Installer
         var ours = new bool[Managed.Length];
         ours[0] = current[0] != null && (legacy || IsOurProxy(current[0]));
         ours[1] = current[1] != null && (legacy || IsOurRenderer(current[1]));
+        ours[2] = current[2] != null && IsOurProxy(current[2]);
         var operations = new List<Operation>();
         if (restore)
         {
-            for (int i = 0; i < Managed.Length; ++i)   // ddraw.dll first: once it is gone the game no longer references the renderer
+            foreach (int i in new[] { 0, 2, 1 })   // the proxies first: once they are gone the game no longer references the renderer
             {
                 string path = Path.Combine(game.Root, Managed[i]);
+                // A msimg32.dll that is not ours was never part of an install; a foreign ddraw.dll next to our msimg32.dll loader is expected.
+                if (current[i] != null && !ours[i] && (i == 2 || (i == 0 && ours[2]))) continue;
                 if (current[i] != null && !ours[i])
                     throw new InvalidOperationException(Managed[i] + " has been replaced by a different file since the patch was installed. The current file was not overwritten.");
                 byte[] saved = Read(game.BackupOf(i)) ?? legacyOriginal[i];
@@ -826,9 +836,19 @@ internal static class Installer
             return operations;
         }
         var payload = new byte[Managed.Length][];
-        for (int i = 0; i < Managed.Length; ++i) payload[i] = Resource(Managed[i]);
+        payload[1] = Resource(Managed[1]);
+        payload[msimg ? 2 : 0] = Resource(Managed[msimg ? 2 : 0]);   // the loader that is wanted; the other one (when it is ours) is removed below
+        // The other loader goes first: two proxies at once would both load the renderer.
+        foreach (int i in new[] { 0, 2 })
+        {
+            if (payload[i] != null || current[i] == null || !ours[i]) continue;
+            byte[] saved = Read(game.BackupOf(i)) ?? legacyOriginal[i];
+            Add(operations, Path.Combine(game.Root, Managed[i]), saved);
+            if (Read(game.BackupOf(i)) != null) Add(operations, game.BackupOf(i), null);
+        }
         for (int i = 0; i < Managed.Length; ++i)
         {
+            if (payload[i] == null) continue;
             // A file that is not ours (another wrapper) is somebody's earlier file: it is kept next to the new one.
             byte[] keep = (current[i] != null && !ours[i] && !Same(current[i], payload[i])) ? current[i] : legacyOriginal[i];
             if (keep == null) continue;
@@ -838,7 +858,7 @@ internal static class Installer
             if (existing == null) Add(operations, game.BackupOf(i), keep);
         }
         // The renderer is in place before ddraw.dll can reference it. Existing user settings are preserved.
-        for (int i = Managed.Length - 1; i >= 0; --i) Add(operations, Path.Combine(game.Root, Managed[i]), payload[i]);
+        foreach (int i in new[] { 1, 0, 2 }) if (payload[i] != null) Add(operations, Path.Combine(game.Root, Managed[i]), payload[i]);
         string ini = Path.Combine(game.Root, IniName);
         if (!File.Exists(ini)) Add(operations, ini, Resource(IniName));
         // The pedestrian voice table is created once; an existing (possibly edited) one is left alone.
@@ -910,7 +930,11 @@ internal static class Installer
             {
                 process.Dispose(); throw new InvalidOperationException("Close Road Rash before running this patch.");
             }
-            var operations = Prepare(game, restore);
+            bool msimg;
+            bool chosen = options != null && options.TryGetValue(LoaderKey, out msimg);
+            if (!chosen) { var now = Status(game.Root); msimg = now.Msimg32Ours; }          // no explicit choice (quiet install, restore): keep the loader in use
+            else msimg = options[LoaderKey];
+            var operations = Prepare(game, restore, msimg);
             bool changed = operations.Count > 0;
             if (changed) Apply(operations);
             RemoveLegacyFolder(game);
@@ -919,7 +943,7 @@ internal static class Installer
             if (!restore) { MergeMissingIniKeys(game); WriteOptions(game, options ?? new Dictionary<string, bool>()); }
             if (!changed)
                 return Finish(game, restore ? "The game is already in its pre-install state." : "This version of MultiFix is already installed. Settings were updated.", false);
-            return Finish(game, restore ? "ddraw.dll and RoadRashMultiFix.dll were removed (any earlier files were restored). RoadRashHD.ini was kept." :
+            return Finish(game, restore ? "ddraw.dll, msimg32.dll (ours) and RoadRashMultiFix.dll were removed (any earlier files were restored). RoadRashHD.ini was kept." :
                 "RoadRash30-MultiFix installed.\nRoadRash95.exe was not changed by this install (only the optional 4 GB switch touches it).\nLaunch the game as usual (GOG Galaxy, EA app, Steam or the desktop shortcut).\nYour saves are unchanged. Settings are in RoadRashHD.ini; if something looks wrong, check RoadRashHD.log in the game folder.", false);
         }
         catch (Exception error)
@@ -1014,15 +1038,17 @@ internal static class Installer
     [STAThread]
     static int Main(string[] args)
     {
-        bool quiet = false, restore = false; string folder = null;
+        bool quiet = false, restore = false; string folder = null; bool? loaderChoice = null;
         foreach (string arg in args)
         {
             if (string.Equals(arg, "/quiet", StringComparison.OrdinalIgnoreCase)) quiet = true;
             else if (string.Equals(arg, "/restore", StringComparison.OrdinalIgnoreCase)) restore = true;
             else if (arg.StartsWith("/path:", StringComparison.OrdinalIgnoreCase)) folder = arg.Substring(6).Trim('"');
+            else if (string.Equals(arg, "/loader:msimg32", StringComparison.OrdinalIgnoreCase)) loaderChoice = true;
+            else if (string.Equals(arg, "/loader:ddraw", StringComparison.OrdinalIgnoreCase)) loaderChoice = false;
             else
             {
-                var invalid = Finish(null, "Usage: double-click to open the installer; /path:\"C:\\Games\\Road Rash\" selects the game folder; /restore restores directly; /quiet runs silently.", true);
+                var invalid = Finish(null, "Usage: double-click to open the installer; /path:\"C:\\Games\\Road Rash\" selects the game folder; /restore restores directly; /quiet runs silently; /loader:msimg32 (or /loader:ddraw) chooses how MultiFix is loaded.", true);
                 if (!quiet) MessageBox.Show(invalid.Message, Title, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return 1;
             }
@@ -1046,7 +1072,8 @@ internal static class Installer
                 }
                 folder = found[0].Path;
             }
-            var result = Execute(restore, folder, null);
+            var loaderOptions = loaderChoice == null ? null : new Dictionary<string, bool> { { LoaderKey, loaderChoice.Value } };
+            var result = Execute(restore, folder, loaderOptions);
             if (!quiet) MessageBox.Show(result.Message, Title, MessageBoxButtons.OK,
                                         result.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
             return result.Success ? 0 : 1;

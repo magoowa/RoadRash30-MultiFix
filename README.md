@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/logo.png" width="420" alt="Road Rash 30 MultiFix"></p>
 
-<p align="center"><b>v2.20.0</b> &nbsp;|&nbsp; <a href="https://github.com/magoowa/RoadRash30-MultiFix/releases/latest"><b>Download the latest release</b></a> &nbsp;|&nbsp; <a href="CHANGELOG.md">Changelog</a></p>
+<p align="center"><b>v2.20.5</b> &nbsp;|&nbsp; <a href="https://github.com/magoowa/RoadRash30-MultiFix/releases/latest"><b>Download the latest release</b></a> &nbsp;|&nbsp; <a href="CHANGELOG.md">Changelog</a></p>
 
 Fixes, widescreen and a Direct3D 11 renderer for **Road Rash: 30th Anniversary Edition** (GOG, EA app and Steam). Authors: **OBLPlife** (original author) and **magoowa**.
 
@@ -60,10 +60,12 @@ Added in this fork:
 - **4 GB Memory (optional):** one switch in the launcher sets the Large Address Aware flag of `RoadRash95.exe` (the 32-bit game then gets up to 4 GB instead of 2 GB, which helps against missing textures and crashes after a few miles). The original is kept as `RoadRash95.exe.multifix-backup`; the launcher shows whether the file is patched and Restore puts it back.
 - **Smooth Road:** the road and its edges no longer jump or pulse as you ride (the half-pixel snapping of the old renderer is removed and the fractions the game drops are added back).
 - **Custom music:** play your own WAV files (CD quality 16-bit 44.1 kHz and 48 kHz work) instead of the game's tracks, with any file names (`[MusicFiles]`) or as a random playlist (`AUDIO\MUSIC\Playlist`). The Audio tab has a help window that explains it.
-- **HUD distance:** the odometer no longer wraps to 0 after 25.5, and an option shows the distance to the finish instead of the distance driven. **Keep completed tracks:** finishing the last level no longer clears the five "track completed" marks of the save.
+- **HUD distance:** the odometer no longer wraps to 0 after 25.5, and an option shows the distance to the finish instead of the distance driven.
 - **Crash diagnostics:** `RoadRashHD.log` records free address space, the first fatal exception, frame hitches and how evenly the player moves; unreadable polygons and textures are skipped instead of crashing the game.
 - **No EXE modification:** loads through a `ddraw.dll` proxy; GOG Galaxy "Verify / Repair" does not undo it.
 - **Installer and launcher:** detects GOG, EA app and Steam installations, shows the executable version, has one row per option (read from and saved to `RoadRashHD.ini` live), a **Play** button, detection of the MultiFix installation and its DLL version in the game folder (if it is missing or outdated, Play asks whether to install/update first; Yes or No, the game starts either way), backup/restore, HiDPI-safe layout and a custom icon.
+- **Compatibility Loader (optional):** a launcher switch that loads MultiFix through `msimg32.dll` instead of the `ddraw.dll` proxy. Use it if the game closes when a race starts (seen on Windows 11 on ARM in a virtual machine, where the system DirectDraw refused the HUD surface while the proxy was present). Windows then uses its own `ddraw.dll`; `/loader:msimg32` selects it from the command line.
+- **Police siren:** the game plays the siren at -90 to -100 dB, so it cannot be heard; the Police Siren Loudness slider (default 80) brings it back.
 - **Pedestrian sounds:** new voices and collision reactions for every kind of pedestrian (including the flag girls and the people at the start), and pedestrians that are no longer far quieter than the rider.
 - **Sprite fixes:** the damaged shadow of the first punch frame and the buildings that hover above the ground (red barn, brown shop, white house) are fixed in memory.
 - **Controllers:** analog throttle on the right trigger; a native DualSense no longer scrolls the menus by itself; optional DualSense support (Bluetooth, d-pad), based on the findings and the local patch of **CypherCripto** ([issue #4](https://github.com/magoowa/RoadRash30-MultiFix/issues/4)).
@@ -123,7 +125,6 @@ All options are in `RoadRashHD.ini` (game folder) and in the installer/launcher 
 | `[Game]` | `LowerRedBarn` / `LowerBrownShop` / `LowerWhiteHouse` | 2 / 3 / 10 | How far the red barn, the brown wooden shop with the sign and the white house are lowered, in rows of their full-size picture (decimals allowed). |
 | `[Game]` | `SmoothRoad` | 1 | Smooth road: removes the half-pixel snapping of the road and its edges and adds back the fractions of elevation and bend the game drops when it projects the track, so the road and the curbs do not jump or pulse. |
 | `[Game]` | `DistanceToFinish` | 0 | The HUD distance counts down to the finish line (course length of the track menu minus the distance driven) instead of up from the start. The odometer no longer wraps to 0 at 25.5, whatever this is set to. |
-| `[Game]` | `KeepCompletedTracks` | 1 | After the last level is finished the five "track completed" marks of the save stay set (the game clears them and shows the ending). Side effect: the ending is probably shown again after each later win; 0 = the game's own behaviour. |
 | `[Game]` | `FixBikeColors` | 1 | Gives the Rat and Super bikes their correct colours in the race. |
 | `[Game]` | `SkipIntro` | 0 | Skips the studio logos and the intro movie; the menu music still plays. |
 | `[Game]` | `RememberLastSave` | 1 | The Load Game dialog opens with the save used last already selected (`LastSave`, written by the game). The controller works the Open / Save as dialogs: D-pad up / down choose, A opens, B cancels (`[Input] PadDialogs`). |
@@ -133,6 +134,7 @@ All options are in `RoadRashHD.ini` (game folder) and in the installer/launcher 
 | `[Audio]` | `PedestrianGainDb` | 3 | How much louder the sounds themselves are, in dB (0-12); the footsteps get twice as much again. |
 | `[Audio]` | `PedestrianVolumeRelief` | 60 | Reduces the attenuation the game applies to those sounds, in percent (0 = as the game sets it, 100 = none). |
 | `[Audio]` | `PedestrianVoiceRelief` | 100 | The same for the pedestrians' voices alone (not the thump or the footsteps); 100 = as loud as the rider's own sounds. |
+| `[Audio]` | `PoliceSirenLoudness` | 80 | How much of the police siren's attenuation is removed, in percent (launcher: Police Siren Loudness slider): 100 = full volume, 0 = the game's own (silent) level. |
 | `[Audio]` | `FemaleVoiceFallback` | 1 | The woman pedestrian that has no voice in the game's data gets the unused voices `FG1_WATC` / `FG2_EEK`. |
 | `[Audio]` | `PedestrianVoiceGapMs` | 120 | Minimum time in milliseconds between two first-reaction voices of pedestrians (0 = no limit). |
 | `[Audio]` | `MidiVolumeGuard` | 1 | The MIDI music level of the Sound Mix screen (master x game music) is applied to the MIDI notes (0 % = silent) and the MIDI volume is not sent to Windows (launcher: Muted Sound Fix). Many MIDI devices ignore the volume the game sets, and on some Windows versions a volume of 0 changes the volume of the whole game in the volume mixer and Windows remembers it. |
